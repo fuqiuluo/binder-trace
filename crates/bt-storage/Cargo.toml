@@ -8,3 +8,6 @@ name = "bt_storage"
 
 [dependencies]
 bt-decoder = { path = "../bt-decoder" }
+
+[dev-dependencies]
+bt-common = { path = "../bt-common" }

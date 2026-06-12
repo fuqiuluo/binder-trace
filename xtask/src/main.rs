@@ -46,7 +46,7 @@ impl Task {
             Self::Check => run_cargo(["check", "--workspace"]),
             Self::Fmt => run_cargo(["fmt", "--all"]),
             Self::Clippy => run_cargo(["clippy", "--workspace", "--all-targets"]),
-            Self::RunCli(args) => run_bt_cli(args),
+            Self::RunCli(args) => run_binder_trace(args),
         }
     }
 }
@@ -86,9 +86,9 @@ fn run_cargo<const N: usize>(args: [&'static str; N]) -> Result<(), XtaskError> 
     run_command(CommandSpec::new(args.join(" "), args))
 }
 
-fn run_bt_cli(args: Vec<String>) -> Result<(), XtaskError> {
+fn run_binder_trace(args: Vec<String>) -> Result<(), XtaskError> {
     let mut command = Command::new("cargo");
-    command.args(["run", "-p", "bt-cli", "--"]);
+    command.args(["run", "-p", "bt-cli", "--bin", "binder-trace", "--"]);
     command.args(&args);
     let status = command.status()?;
 
@@ -96,7 +96,7 @@ fn run_bt_cli(args: Vec<String>) -> Result<(), XtaskError> {
         Ok(())
     } else {
         Err(XtaskError::CargoFailed {
-            command: format!("run -p bt-cli -- {}", args.join(" ")),
+            command: format!("run -p bt-cli --bin binder-trace -- {}", args.join(" ")),
             code: status.code(),
         })
     }
@@ -138,7 +138,7 @@ Commands:
   check       Run cargo check for the workspace
   fmt         Format the workspace
   clippy      Run clippy for all targets
-  run [args]  Run bt-cli with optional arguments
+  run [args]  Run binder-trace with optional arguments
 "
     );
 }

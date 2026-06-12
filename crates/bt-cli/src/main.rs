@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bt_agent::{Agent, AgentConfig, AgentError, OutputConfig};
+use bt_agent::{Agent, AgentConfig, AgentError, KernelConfigSource, OutputConfig};
 
 fn main() -> ExitCode {
     match Command::from_args(env::args().skip(1)).and_then(Command::run) {
@@ -33,6 +33,24 @@ impl Command {
                         return Err(CliError::MissingValue(arg));
                     };
                     config.output = OutputConfig::JsonlFile(PathBuf::from(path));
+                }
+                "--kernel-config-gz" => {
+                    let Some(path) = args.next() else {
+                        return Err(CliError::MissingValue(arg));
+                    };
+                    config.kernel_config_source = KernelConfigSource::GzipFile(PathBuf::from(path));
+                }
+                "--kernel-config-text" => {
+                    let Some(path) = args.next() else {
+                        return Err(CliError::MissingValue(arg));
+                    };
+                    config.kernel_config_source = KernelConfigSource::TextFile(PathBuf::from(path));
+                }
+                "--device-id" => {
+                    let Some(device_id) = args.next() else {
+                        return Err(CliError::MissingValue(arg));
+                    };
+                    config.device_id = Some(device_id);
                 }
                 other => return Err(CliError::UnknownArgument(other.to_owned())),
             }
@@ -74,14 +92,17 @@ impl std::error::Error for CliError {}
 fn print_help() {
     println!(
         "\
-bt-cli
+binder-trace
 
 Usage:
-  bt-cli [--output <path>]
+  binder-trace [--output <path>] [--kernel-config-gz <path>] [--device-id <id>]
 
 Options:
-  -o, --output <path>  Write JSONL output to a file instead of stdout
-  -h, --help           Print help
+  -o, --output <path>       Write JSONL output to a file instead of stdout
+      --kernel-config-gz    Read gzip kernel config from a custom path
+      --kernel-config-text  Read plain text kernel config from a custom path
+      --device-id <id>      Override emitted message envelope device_id
+  -h, --help                Print help
 "
     );
 }
