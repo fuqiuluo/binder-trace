@@ -1,0 +1,8 @@
+/target
+/.idea
+/.claude
+/.vscode
+/.DS_Store
+*.log
+/.agent
+/.cache

@@ -1,0 +1,9 @@
+[package]
+name = "bt-common"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "bt_common"
+
+[dependencies]

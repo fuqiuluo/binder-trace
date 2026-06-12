@@ -1,0 +1,10 @@
+[package]
+name = "bt-decoder"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "bt_decoder"
+
+[dependencies]
+bt-common = { path = "../bt-common" }

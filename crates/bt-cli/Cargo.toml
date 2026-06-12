@@ -1,0 +1,11 @@
+[package]
+name = "bt-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bt-cli"
+path = "src/main.rs"
+
+[dependencies]
+bt-agent = { path = "../bt-agent" }

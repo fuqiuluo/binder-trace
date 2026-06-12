@@ -1,0 +1,10 @@
+[package]
+name = "bt-storage"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "bt_storage"
+
+[dependencies]
+bt-decoder = { path = "../bt-decoder" }

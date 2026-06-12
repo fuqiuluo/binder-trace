@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "xtask",
+    "crates/bt-common",
+    "crates/bt-ebpf",
+    "crates/bt-agent",
+    "crates/bt-decoder",
+    "crates/bt-storage",
+    "crates/bt-cli",
+    "crates/bt-web",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
