@@ -7,7 +7,9 @@ edition.workspace = true
 name = "bt_agent"
 
 [dependencies]
-bitflags = "2.13.0"
 bt-common = { path = "../bt-common" }
 bt-decoder = { path = "../bt-decoder" }
 bt-storage = { path = "../bt-storage" }
+libc = "0.2.186"
+thiserror = "2.0.18"
+tracing = "0.1.44"

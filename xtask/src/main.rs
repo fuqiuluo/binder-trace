@@ -1,3 +1,12 @@
+//! 项目本地开发任务入口。
+//!
+//! # 职责
+//! - 固化 workspace 常用检查命令，避免每个开发者手写不同的 cargo 参数。
+//! - 作为调试入口转发 `binder-trace` 参数，不参与业务配置解析。
+//!
+//! # 不变量
+//! - xtask 只编排本地命令；真正的采集、解码和输出逻辑必须留在各业务 crate 中。
+
 use std::env;
 use std::fmt;
 use std::process::{Command, ExitCode};
@@ -18,6 +27,7 @@ enum Task {
     Check,
     Fmt,
     Clippy,
+    // `run` 后面的参数原样交给 binder-trace，让 CLI 自己维护参数契约。
     RunCli(Vec<String>),
 }
 
@@ -116,6 +126,7 @@ fn run_command<const N: usize>(spec: CommandSpec<N>) -> Result<(), XtaskError> {
 }
 
 struct CommandSpec<const N: usize> {
+    // 失败信息里展示的是用户能直接复制运行的 cargo 子命令，而不是 Debug 格式参数数组。
     display: String,
     args: [&'static str; N],
 }
@@ -131,14 +142,14 @@ fn print_help() {
         "\
 binder-trace xtask
 
-Usage:
+用法:
   cargo run -p xtask -- <command>
 
-Commands:
-  check       Run cargo check for the workspace
-  fmt         Format the workspace
-  clippy      Run clippy for all targets
-  run [args]  Run binder-trace with optional arguments
+命令:
+  check       运行 workspace 检查
+  fmt         格式化 workspace
+  clippy      对所有 target 运行 clippy
+  run [args]  带参数运行 binder-trace
 "
     );
 }

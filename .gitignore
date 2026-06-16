@@ -6,3 +6,17 @@
 *.log
 /.agent
 /.cache
+/kernel/*.ko
+/kernel/*.mod
+/kernel/*.mod.c
+/kernel/*.o
+/kernel/*.lto.o
+/kernel/*.lds
+/kernel/*.order
+/kernel/*.symvers
+/kernel/Module.symvers
+/kernel/.*.cmd
+/kernel/**/*.o
+/kernel/**/*.cmd
+/kernel/**/.*.cmd
+/kernel/compile_commands.json

@@ -1,8 +1,8 @@
 # Binder Trace 开发规范
 
-更新时间: 2026-06-12
+更新时间: 2026-06-16
 
-本文记录项目的文档要求和代码要求。后续实现 Binder/eBPF/内核 ABI 相关逻辑时，必须先满足这里的约束。
+本文记录项目的文档要求和代码要求。后续实现 Binder/内核模块/内核 ABI 相关逻辑时，必须先满足这里的约束。
 
 ## 1. 注释要求
 
@@ -24,8 +24,8 @@
 适用范围包括:
 
 - Binder UAPI 结构体、常量、命令码和返回码。
-- Binder driver 内部函数、tracepoint、kprobe/fentry 目标。
-- eBPF program 读取的内核字段、用户态指针和事件格式。
+- Binder driver 内部函数、tracepoint、inline hook 目标。
+- 内核模块读取的内核字段、用户态指针和事件格式。
 - 根据内核行为实现的解析、状态关联、fallback 逻辑。
 
 源码位置必须包含:
@@ -43,7 +43,7 @@
 // 路径：include/uapi/linux/android/binder.h
 // 符号：struct binder_write_read、struct binder_transaction_data
 // 链接：https://android.googlesource.com/kernel/common/+/refs/heads/android-mainline/include/uapi/linux/android/binder.h
-// 约束：这里不能假设高层 Parcel 参数类型，eBPF 只传递原始长度和采样 payload。
+// 约束：这里不能假设高层 Parcel 参数类型，采集层只传递原始长度和采样 payload。
 ```
 
 如果来源来自实际设备，也要记录设备上下文:
@@ -71,7 +71,7 @@
 
 ### 4.1 依赖要求
 
-实现通用能力时，优先评估成熟库，不要在项目里重复造轮子。例如 bitflags、错误类型、序列化、命令行解析、压缩解压、eBPF loader 这类已有稳定生态的能力，应先考虑引入库。
+实现通用能力时，优先评估成熟库，不要在项目里重复造轮子。例如 bitflags、错误类型、序列化、命令行解析、压缩解压这类已有稳定生态的能力，应先考虑引入库。
 
 新增第三方依赖前，必须先向项目维护者说明:
 
@@ -84,21 +84,20 @@
 
 ### 4.2 Crate 边界
 
-`bt-common` 是 eBPF 和用户态共享边界，必须保持简单:
+`bt-common` 是内核采集侧和用户态共享边界，必须保持简单:
 
 - 优先使用 `#[repr(C)]`、固定宽度整数和小型枚举。
 - 避免复杂泛型、堆分配、动态 dispatch 和非必要依赖。
 - 共享结构体字段变更时，要同步说明 ABI 影响。
 
-`bt-ebpf` 负责内核态采集，不在 eBPF 程序里做高层 Parcel/AIDL 语义解析。eBPF 侧只做过滤、长度控制、事件打包和必要的状态关联。
+`kernel/` 负责内核态采集，不在内核 hook 路径里做高层 Parcel/AIDL 语义解析。内核侧只做过滤、长度控制、事件打包和必要的状态关联。
 
 用户态 crate 的职责边界:
 
-- `bt-agent` 负责加载、运行、融合事件流。
+- `bt-agent` 负责读取内核模块事件、运行用户态编排和融合事件流。
 - `bt-decoder` 负责把 raw event 解码成上层事件。
 - `bt-storage` 负责持久化，当前优先 JSONL。
 - `bt-cli` 负责调试体验，后续可以参考 `stackplz` 的交互方式。
-- `bt-web` 只承担 Web UI/service 表达，不反向污染采集和解码层。
 
 ## 5. 提交前检查
 
@@ -107,6 +106,6 @@
 - 新增注释是否为中文。
 - 每个内核结构体、常量、tracepoint、hook 点是否有源码位置。
 - 是否明确写出参考的 branch/tag/commit。
-- 是否避免在 eBPF 侧解析高层 Parcel/AIDL 语义。
+- 是否避免在内核采集侧解析高层 Parcel/AIDL 语义。
 - `bt-common` 是否仍然足够简单，且没有引入不必要依赖。
 - 是否跑过 `cargo run -p xtask -- check`。

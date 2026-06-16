@@ -2,12 +2,10 @@
 members = [
     "xtask",
     "crates/bt-common",
-    "crates/bt-ebpf",
     "crates/bt-agent",
     "crates/bt-decoder",
     "crates/bt-storage",
     "crates/bt-cli",
-    "crates/bt-web",
 ]
 resolver = "3"
 

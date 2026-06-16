@@ -1,9 +1,0 @@
-[package]
-name = "bt-web"
-version.workspace = true
-edition.workspace = true
-
-[lib]
-name = "bt_web"
-
-[dependencies]
