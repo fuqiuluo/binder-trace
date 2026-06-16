@@ -17,14 +17,30 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 
-const GREEN: &str = "\x1b[38;5;120m";
-const CYAN: &str = "\x1b[38;5;51m";
-const YELLOW: &str = "\x1b[38;5;226m";
-const DIM: &str = "\x1b[2m";
-const BOLD: &str = "\x1b[1m";
-const RESET: &str = "\x1b[0m";
-const SELECTED: &str = "\x1b[30;46m";
-const STATUS: &str = "\x1b[30;46m";
+mod theme {
+    use std::fmt;
+
+    use anstyle::{Ansi256Color, AnsiColor, Color, Style};
+
+    pub const BORDER: Style = ansi256_fg(120);
+    pub const TRANSACTION_SEND: Style = ansi256_fg(51);
+    pub const TRANSACTION_REPLY: Style = ansi256_fg(226);
+    pub const FREQUENCY: Style = ansi256_fg(120);
+    pub const MUTED: Style = Style::new().dimmed();
+    pub const TITLE: Style = Style::new().bold();
+    pub const SELECTED: Style = Style::new()
+        .fg_color(Some(Color::Ansi(AnsiColor::Black)))
+        .bg_color(Some(Color::Ansi(AnsiColor::Cyan)));
+    pub const STATUS: Style = SELECTED;
+
+    const fn ansi256_fg(index: u8) -> Style {
+        Style::new().fg_color(Some(Color::Ansi256(Ansi256Color(index))))
+    }
+
+    pub fn paint(style: Style, text: impl fmt::Display) -> String {
+        format!("{style}{text}{style:#}")
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct TuiConfig {
@@ -509,11 +525,11 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
                 );
                 let fitted = fit(&line, inner_width);
                 if index == state.selected {
-                    lines.push(format!("{SELECTED}{fitted}{RESET}"));
+                    lines.push(theme::paint(theme::SELECTED, fitted));
                 } else if event.is_reply() {
-                    lines.push(format!("{YELLOW}{fitted}{RESET}"));
+                    lines.push(theme::paint(theme::TRANSACTION_REPLY, fitted));
                 } else {
-                    lines.push(format!("{CYAN}{fitted}{RESET}"));
+                    lines.push(theme::paint(theme::TRANSACTION_SEND, fitted));
                 }
             }
 
@@ -541,7 +557,7 @@ fn render_frequency(state: &TuiState, width: usize, height: usize) -> Vec<String
                 entry.count,
                 label_width = label_width
             );
-            lines.push(format!("{GREEN}{}{RESET}", fit(&line, inner_width)));
+            lines.push(theme::paint(theme::FREQUENCY, fit(&line, inner_width)));
         }
 
         lines
@@ -592,7 +608,7 @@ fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
             };
 
             let lines = [
-                format!("{BOLD}{}{RESET}", fit("binder_transaction", inner_width)),
+                theme::paint(theme::TITLE, fit("binder_transaction", inner_width)),
                 format!("direction: {}", direction(event)),
                 format!("sequence: {}", event.sequence),
                 format!("timestamp_ns: {}", event.timestamp_ns),
@@ -608,8 +624,9 @@ fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
             lines
                 .into_iter()
                 .take(inner_height)
-                .map(|line| {
-                    if line.contains(RESET) {
+                .enumerate()
+                .map(|(index, line)| {
+                    if index == 0 {
                         line
                     } else {
                         fit(&line, inner_width)
@@ -653,7 +670,7 @@ fn render_status(state: &TuiState, width: usize) -> String {
         "Family: {}  Transactions: {}  Filter: [tgid=*, pid=*, uid=*]  Recording: {}  Input: {}  Selected: {}  Uptime: {}s  q=quit h=help space=toggle c=clear",
         state.family, state.stats.captured, recording, input, selected, uptime
     );
-    format!("{STATUS}{}{RESET}", fit(&text, width))
+    theme::paint(theme::STATUS, fit(&text, width))
 }
 
 fn render_panel(
@@ -673,17 +690,27 @@ fn render_panel(
         .into_iter()
         .take(inner_height)
     {
-        lines.push(format!("{GREEN}|{RESET}{line}{GREEN}|{RESET}"));
+        lines.push(format!(
+            "{}{}{}",
+            theme::paint(theme::BORDER, "|"),
+            line,
+            theme::paint(theme::BORDER, "|")
+        ));
     }
 
     while lines.len() + 1 < height {
         lines.push(format!(
-            "{GREEN}|{RESET}{}{GREEN}|{RESET}",
-            " ".repeat(inner_width)
+            "{}{}{}",
+            theme::paint(theme::BORDER, "|"),
+            " ".repeat(inner_width),
+            theme::paint(theme::BORDER, "|")
         ));
     }
 
-    lines.push(format!("{GREEN}+{}+{RESET}", "-".repeat(inner_width)));
+    lines.push(theme::paint(
+        theme::BORDER,
+        format!("+{}+", "-".repeat(inner_width)),
+    ));
     lines
 }
 
@@ -691,21 +718,19 @@ fn top_border(title: &str, width: usize) -> String {
     let inner_width = width.saturating_sub(2);
     let title = format!(" {title} ");
     if title.len() >= inner_width {
-        return format!("{GREEN}+{}+{RESET}", fit(&title, inner_width));
+        return theme::paint(theme::BORDER, format!("+{}+", fit(&title, inner_width)));
     }
 
     let left = (inner_width - title.len()) / 2;
     let right = inner_width - title.len() - left;
-    format!(
-        "{GREEN}+{}{}{}+{RESET}",
-        "-".repeat(left),
-        title,
-        "-".repeat(right)
+    theme::paint(
+        theme::BORDER,
+        format!("+{}{}{}+", "-".repeat(left), title, "-".repeat(right)),
     )
 }
 
 fn dim_line(text: &str, width: usize) -> String {
-    format!("{DIM}{}{RESET}", fit(text, width))
+    theme::paint(theme::MUTED, fit(text, width))
 }
 
 fn fit(text: &str, width: usize) -> String {

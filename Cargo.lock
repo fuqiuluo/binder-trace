@@ -83,6 +83,7 @@ dependencies = [
 name = "bt-cli"
 version = "0.1.0"
 dependencies = [
+ "anstyle",
  "bt-agent",
  "clap",
  "crossterm",
