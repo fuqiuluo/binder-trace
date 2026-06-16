@@ -21,6 +21,16 @@ void bt_event_emit_binder_transaction(
     const void *thread,
     const void *tr,
     int reply,
-    unsigned long extra_buffers_size);
+    unsigned long extra_buffers_size,
+    __u32 code,
+    __u32 transaction_flags,
+    __u64 data_size,
+    __u64 offsets_size,
+    __u32 target_handle,
+    __u32 sender_pid,
+    __u32 sender_euid,
+    const __u8 *payload,
+    __u32 payload_len,
+    bool payload_truncated);
 
 #endif /* BINDER_TRACE_KMOD_EVENT_H */

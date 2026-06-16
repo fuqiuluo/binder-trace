@@ -3,6 +3,7 @@
 #include <linux/cred.h>
 #include <linux/errno.h>
 #include <linux/ktime.h>
+#include <linux/minmax.h>
 #include <linux/poll.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
@@ -120,11 +121,22 @@ void bt_event_emit_binder_transaction(
     const void *thread,
     const void *tr,
     int reply,
-    unsigned long extra_buffers_size)
+    unsigned long extra_buffers_size,
+    __u32 code,
+    __u32 transaction_flags,
+    __u64 data_size,
+    __u64 offsets_size,
+    __u32 target_handle,
+    __u32 sender_pid,
+    __u32 sender_euid,
+    const __u8 *payload,
+    __u32 payload_len,
+    bool payload_truncated)
 {
     struct bt_binder_event event;
-    unsigned long flags;
+    unsigned long irq_flags;
     u64 sequence;
+    __u32 inline_len = min_t(__u32, payload_len, BT_MAX_INLINE_PAYLOAD);
 
     event = (struct bt_binder_event){
         .timestamp_ns = ktime_get_ns(),
@@ -138,13 +150,25 @@ void bt_event_emit_binder_transaction(
         .proc = (unsigned long)proc,
         .thread = (unsigned long)thread,
         .extra_buffers_size = extra_buffers_size,
+        .code = code,
+        .flags = transaction_flags,
+        .data_size = data_size,
+        .offsets_size = offsets_size,
+        .target_handle = target_handle,
+        .sender_pid = sender_pid,
+        .sender_euid = sender_euid,
+        .payload_len = inline_len,
+        .payload_truncated = payload_truncated ? 1U : 0U,
     };
+    if (payload && inline_len) {
+        memcpy(event.payload, payload, inline_len);
+    }
 
-    spin_lock_irqsave(&bt_event_lock, flags);
+    spin_lock_irqsave(&bt_event_lock, irq_flags);
     sequence = bt_event_next_sequence++;
     event.sequence = sequence;
     bt_event_ring[sequence & BT_EVENT_RING_MASK] = event;
-    spin_unlock_irqrestore(&bt_event_lock, flags);
+    spin_unlock_irqrestore(&bt_event_lock, irq_flags);
 
     wake_up_interruptible_poll(&bt_event_waitq, EPOLLIN | EPOLLRDNORM);
 }

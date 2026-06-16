@@ -10,7 +10,7 @@
  * SOCK_STREAM 返回 ENOKEY、SOCK_RAW 可创建的 family 后再发送 ioctl。
  */
 
-#define BT_ABI_VERSION 1U
+#define BT_ABI_VERSION 2U
 #define BT_IOC_MAGIC 'B'
 #define BT_DRIVER_FEATURE_MAGIC 0x4254524143453031ULL
 #define BT_DRIVER_FEATURE_NAME "binder-trace"
@@ -19,6 +19,7 @@
 #define BT_FEATURE_EVENT_STREAM (1U << 1)
 
 #define BT_EVENT_KIND_BINDER_TRANSACTION 1U
+#define BT_MAX_INLINE_PAYLOAD 256U
 
 #define BT_CAPTURE_POINT_IOCTL (1U << 0)
 #define BT_CAPTURE_POINT_COPY_TO_USER (1U << 1)
@@ -62,10 +63,10 @@ struct bt_capture_stats {
 /*
  * Binder 事件流通过同一个自定义 socket 的 recvmsg 读取。
  *
- * 这里只暴露跨 Android common 5.10/5.15/6.1/6.6/6.12 稳定的信息：
- * 当前任务身份、binder_transaction() 的 reply 标记和入口指针值。
- * 不在内核模块里解引用 binder_proc/binder_thread/binder_transaction_data，
- * 后续如果要解析字段，必须按目标内核版本显式适配。
+ * 这里只解引用 Android Binder UAPI 中稳定的 binder_transaction_data 字段：
+ * code、flags、data_size、offsets_size、target.handle、sender_pid、sender_euid。
+ * data.ptr.buffer 指向发送方用户态 Parcel，模块只 best-effort 拷贝前 256 字节；
+ * 失败时 payload_len 为 0，不能影响原始 binder_transaction() 调用。
  */
 struct bt_binder_event {
     __u64 sequence;
@@ -80,6 +81,17 @@ struct bt_binder_event {
     __u64 proc;
     __u64 thread;
     __u64 extra_buffers_size;
+    __u32 code;
+    __u32 flags;
+    __u64 data_size;
+    __u64 offsets_size;
+    __u32 target_handle;
+    __u32 sender_pid;
+    __u32 sender_euid;
+    __u32 payload_len;
+    __u8 payload_truncated;
+    __u8 _reserved[7];
+    __u8 payload[BT_MAX_INLINE_PAYLOAD];
 };
 
 #define BT_IOC_GET_ABI_VERSION _IOR(BT_IOC_MAGIC, 0x00, struct bt_abi_version)

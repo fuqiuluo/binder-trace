@@ -10,7 +10,7 @@
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Duration;
 
 use bt_agent::{
@@ -113,6 +113,13 @@ struct TuiCommand {
 
     #[arg(long, help = "只读事件流，不自动更新内核捕获配置")]
     no_enable: bool,
+
+    #[arg(
+        long,
+        value_name = "sdk",
+        help = "Android SDK 版本；未指定时尝试读取 ro.build.version.sdk"
+    )]
+    android_sdk: Option<u16>,
 }
 
 impl TuiCommand {
@@ -137,6 +144,7 @@ impl TuiCommand {
                 rows: self.rows,
                 refresh: Duration::from_millis(self.refresh_ms),
                 capture_config: (!self.no_enable).then_some(capture_config),
+                android_sdk: self.android_sdk.or_else(detect_android_sdk),
             },
         )
         .map_err(CliError::Tui)
@@ -274,6 +282,22 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .compact()
         .init();
+}
+
+fn detect_android_sdk() -> Option<u16> {
+    let output = ProcessCommand::new("getprop")
+        .arg("ro.build.version.sdk")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn print_feature(family: i32, feature: DriverFeature) {

@@ -33,7 +33,7 @@
 - `BT_IOC_CLEAR_STATS`
 - `BT_IOC_GET_FEATURE`
 
-自定义协议族同时承载低频控制面和当前阶段的事件流：ioctl 负责开启/关闭捕获、基础过滤和统计读取，`recvmsg`/`poll`/`epoll` 负责读取内核推送的固定布局 Binder 事件。事件结构只包含跨版本稳定的入口参数和当前任务身份，不在内核里解引用 Binder 私有结构体。
+自定义协议族同时承载低频控制面和当前阶段的事件流：ioctl 负责开启/关闭捕获、基础过滤和统计读取，`recvmsg`/`poll`/`epoll` 负责读取内核推送的固定布局 Binder 事件。事件结构当前为 ABI v2，包含当前任务身份、`binder_transaction()` 入口指针、transaction code、data/offsets 大小、目标 handle、发送方 pid/euid，以及发送方用户态 Parcel 的前 256 字节。模块只读取 Android Binder UAPI 里稳定的 `struct binder_transaction_data` 字段，不解引用 `struct binder_proc`、`struct binder_thread` 等 Binder 私有结构体。
 
 ## 版本来源
 

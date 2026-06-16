@@ -85,6 +85,7 @@ version = "0.1.0"
 dependencies = [
  "anstyle",
  "bt-agent",
+ "bt-decoder",
  "clap",
  "crossterm",
  "libc",

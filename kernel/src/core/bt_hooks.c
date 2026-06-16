@@ -4,9 +4,12 @@
 #include <linux/compiler.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/kernel.h>
 #include <linux/rcupdate.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <uapi/linux/android/binder.h>
 
 #include "bt_capture.h"
 #include "bt_common.h"
@@ -19,7 +22,6 @@ struct binder_alloc;
 struct binder_buffer;
 struct binder_proc;
 struct binder_thread;
-struct binder_transaction_data;
 
 typedef uintptr_t bt_binder_size_t;
 
@@ -71,6 +73,42 @@ static void bt_wait_for_active_hooks(void)
         }
         msleep(20);
     }
+}
+
+/*
+ * 这里只拷贝发送方用户态 Parcel 的前缀，用于用户态解析 interface token。
+ * copy_from_user() 失败时留空并继续调用原始 binder_transaction()。
+ */
+static __u32 bt_copy_transaction_payload(
+    const struct binder_transaction_data *tr,
+    __u8 payload[BT_MAX_INLINE_PAYLOAD],
+    bool *payload_truncated)
+{
+    size_t inline_len;
+
+    if (!tr || !payload || !payload_truncated) {
+        return 0;
+    }
+
+    *payload_truncated = false;
+    memset(payload, 0, BT_MAX_INLINE_PAYLOAD);
+
+    if (!tr->data_size || !tr->data.ptr.buffer) {
+        return 0;
+    }
+
+    inline_len = min_t(size_t, (size_t)tr->data_size, BT_MAX_INLINE_PAYLOAD);
+    if (copy_from_user(
+            payload,
+            (const void __user *)(uintptr_t)tr->data.ptr.buffer,
+            inline_len)) {
+        *payload_truncated = true;
+        memset(payload, 0, BT_MAX_INLINE_PAYLOAD);
+        return 0;
+    }
+
+    *payload_truncated = tr->data_size > BT_MAX_INLINE_PAYLOAD;
+    return (__u32)inline_len;
 }
 
 /*
@@ -197,22 +235,39 @@ static __nocfi void bt_hook_binder_transaction(
     int reply,
     bt_binder_size_t extra_buffers_size)
 {
+    __u8 payload[BT_MAX_INLINE_PAYLOAD] = {0};
+    __u32 payload_len = 0;
+    bool payload_truncated = false;
+
     bt_hook_enter();
 
     if (!READ_ONCE(bt_hooks_draining) &&
         bt_capture_should_trace(BT_CAPTURE_POINT_TRANSACTION, 0, (size_t)extra_buffers_size)) {
+        payload_len = bt_copy_transaction_payload(tr, payload, &payload_truncated);
         bt_event_emit_binder_transaction(
             proc,
             thread,
             tr,
             reply,
-            (unsigned long)extra_buffers_size);
+            (unsigned long)extra_buffers_size,
+            tr ? tr->code : 0,
+            tr ? tr->flags : 0,
+            tr ? tr->data_size : 0,
+            tr ? tr->offsets_size : 0,
+            tr ? tr->target.handle : 0,
+            tr ? (__u32)tr->sender_pid : 0,
+            tr ? (__u32)tr->sender_euid : 0,
+            payload,
+            payload_len,
+            payload_truncated);
         bt_info_ratelimited(
-            "binder_transaction proc=%px thread=%px tr=%px reply=%d extra=0x%lx\n",
+            "binder_transaction proc=%px thread=%px tr=%px reply=%d code=%u size=0x%llx extra=0x%lx\n",
             proc,
             thread,
             tr,
             reply,
+            tr ? tr->code : 0,
+            tr ? (unsigned long long)tr->data_size : 0,
             (unsigned long)extra_buffers_size);
     }
 

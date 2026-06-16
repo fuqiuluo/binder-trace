@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use bt_agent::{BinderEvent, CaptureConfig, CaptureStats, SocketIpcClient, SocketIpcError};
+use bt_decoder::{AndroidPlatformMethods, parse_interface_token};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
@@ -47,6 +48,7 @@ pub struct TuiConfig {
     pub rows: usize,
     pub refresh: Duration,
     pub capture_config: Option<CaptureConfig>,
+    pub android_sdk: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -102,11 +104,19 @@ struct TuiState {
     recording: bool,
     help_visible: bool,
     input_available: bool,
+    android_sdk: Option<u16>,
+    platform_methods: Option<AndroidPlatformMethods>,
     start: Instant,
 }
 
 impl TuiState {
-    fn new(family: i32, capacity: usize, stats: CaptureStats, input_available: bool) -> Self {
+    fn new(
+        family: i32,
+        capacity: usize,
+        stats: CaptureStats,
+        input_available: bool,
+        android_sdk: Option<u16>,
+    ) -> Self {
         Self {
             family,
             capacity: capacity.max(1),
@@ -116,6 +126,8 @@ impl TuiState {
             recording: true,
             help_visible: false,
             input_available,
+            android_sdk,
+            platform_methods: android_sdk.map(AndroidPlatformMethods::new),
             start: Instant::now(),
         }
     }
@@ -193,6 +205,7 @@ pub fn run_tui(client: &SocketIpcClient, family: i32, config: TuiConfig) -> Resu
         config.rows.max(1),
         client.get_stats()?,
         terminal.input.is_some(),
+        config.android_sdk,
     );
     let refresh = config
         .refresh
@@ -498,11 +511,9 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
         width,
         height,
         |inner_width, inner_height| {
+            let columns = TransactionColumns::new(inner_width);
             let mut lines = Vec::with_capacity(inner_height);
-            lines.push(dim_line(
-                "dir   tgid/pid     uid       transaction        extra lost",
-                inner_width,
-            ));
+            lines.push(theme::paint(theme::MUTED, columns.header()));
 
             let visible_rows = inner_height.saturating_sub(1);
             let start = if state.selected >= visible_rows {
@@ -513,17 +524,13 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
 
             for index in start..state.events.len().min(start + visible_rows) {
                 let event = &state.events[index];
-                let line = format!(
-                    "{:<5} {:>5}/{:<5} {:<9} 0x{:08x} {:>5x} {:>4}",
-                    direction(event),
-                    event.tgid,
-                    event.pid,
-                    event.uid,
-                    low32(event.transaction),
-                    event.extra_buffers_size,
-                    event.lost_before,
+                let summary = TransactionSummary::new(event, state.platform_methods);
+                let fitted = columns.row(
+                    summary.interface.as_str(),
+                    &event.code.to_string(),
+                    summary.method,
+                    &format!("0x{:x}", event.data_size),
                 );
-                let fitted = fit(&line, inner_width);
                 if index == state.selected {
                     lines.push(theme::paint(theme::SELECTED, fitted));
                 } else if event.is_reply() {
@@ -536,6 +543,57 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
             lines
         },
     )
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct TransactionColumns {
+    interface: usize,
+    code: usize,
+    method: usize,
+    len: usize,
+}
+
+impl TransactionColumns {
+    fn new(width: usize) -> Self {
+        const GAP_WIDTH: usize = 3;
+        const CODE_WIDTH: usize = 10;
+        const LEN_WIDTH: usize = 10;
+        const MIN_INTERFACE_WIDTH: usize = 10;
+        const PREFERRED_METHOD_WIDTH: usize = 22;
+
+        let available = width.saturating_sub(GAP_WIDTH);
+        let code = CODE_WIDTH.min(available);
+        let remaining = available.saturating_sub(code);
+        let len = LEN_WIDTH.min(remaining);
+        let remaining = remaining.saturating_sub(len);
+        let method = if remaining > MIN_INTERFACE_WIDTH {
+            PREFERRED_METHOD_WIDTH.min(remaining - MIN_INTERFACE_WIDTH)
+        } else {
+            remaining / 3
+        };
+        let interface = remaining.saturating_sub(method);
+
+        Self {
+            interface,
+            code,
+            method,
+            len,
+        }
+    }
+
+    fn header(self) -> String {
+        self.row("Interface", "#", "Method", "Len")
+    }
+
+    fn row(self, interface: &str, code: &str, method: &str, len: &str) -> String {
+        format!(
+            "{} {} {} {}",
+            fit(interface, self.interface),
+            fit_right(code, self.code),
+            fit(method, self.method),
+            fit_right(len, self.len),
+        )
+    }
 }
 
 fn render_frequency(state: &TuiState, width: usize, height: usize) -> Vec<String> {
@@ -570,7 +628,11 @@ fn render_hexdump(state: &TuiState, width: usize, height: usize) -> Vec<String> 
             return vec![dim_line("等待 binder_transaction 事件", inner_width)];
         };
 
-        let bytes = event_bytes(event);
+        let bytes = event.payload_bytes();
+        if bytes.is_empty() {
+            return vec![dim_line("payload 为空或未捕获", inner_width)];
+        }
+
         bytes
             .chunks(16)
             .take(inner_height)
@@ -606,9 +668,30 @@ fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
             let Some(event) = state.selected_event() else {
                 return vec![dim_line("选择事件后显示解析结果", inner_width)];
             };
+            let summary = TransactionSummary::new(event, state.platform_methods);
 
             let lines = [
                 theme::paint(theme::TITLE, fit("binder_transaction", inner_width)),
+                format!("interface: {}", summary.interface.as_str()),
+                format!("code: {}", event.code),
+                format!("method: {}", summary.method),
+                format!("flags: 0x{:x}", event.flags),
+                format!("data_size: 0x{:x}", event.data_size),
+                format!("offsets_size: 0x{:x}", event.offsets_size),
+                format!("target_handle: {}", event.target_handle),
+                format!(
+                    "sender_pid/euid: {}/{}",
+                    event.sender_pid, event.sender_euid
+                ),
+                format!(
+                    "payload: {} bytes{}",
+                    event.payload_bytes().len(),
+                    if event.payload_truncated != 0 {
+                        " truncated"
+                    } else {
+                        ""
+                    }
+                ),
                 format!("direction: {}", direction(event)),
                 format!("sequence: {}", event.sequence),
                 format!("timestamp_ns: {}", event.timestamp_ns),
@@ -666,9 +749,13 @@ fn render_status(state: &TuiState, width: usize) -> String {
     } else {
         "False"
     };
+    let sdk = state
+        .android_sdk
+        .map(|sdk| sdk.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
     let text = format!(
-        "Family: {}  Transactions: {}  Filter: [tgid=*, pid=*, uid=*]  Recording: {}  Input: {}  Selected: {}  Uptime: {}s  q=quit h=help space=toggle c=clear",
-        state.family, state.stats.captured, recording, input, selected, uptime
+        "Family: {}  SDK: {}  Transactions: {}  Filter: [tgid=*, pid=*, uid=*]  Recording: {}  Input: {}  Selected: {}  Uptime: {}s  q=quit h=help space=toggle c=clear",
+        state.family, sdk, state.stats.captured, recording, input, selected, uptime
     );
     theme::paint(theme::STATUS, fit(&text, width))
 }
@@ -742,12 +829,46 @@ fn fit(text: &str, width: usize) -> String {
     result
 }
 
+fn fit_right(text: &str, width: usize) -> String {
+    let result: String = text.chars().take(width).collect();
+    let visible = result.chars().count();
+    if visible < width {
+        format!("{}{}", " ".repeat(width - visible), result)
+    } else {
+        result
+    }
+}
+
 fn direction(event: &BinderEvent) -> &'static str {
     if event.is_reply() { "reply" } else { "send" }
 }
 
-fn low32(value: u64) -> u32 {
-    (value & u64::from(u32::MAX)) as u32
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TransactionSummary {
+    interface: String,
+    method: &'static str,
+}
+
+impl TransactionSummary {
+    fn new(event: &BinderEvent, platform_methods: Option<AndroidPlatformMethods>) -> Self {
+        if event.is_reply() {
+            return Self {
+                interface: String::new(),
+                method: "",
+            };
+        }
+
+        let interface = parse_interface_token(event.payload_bytes()).unwrap_or_default();
+        let method = if interface.is_empty() {
+            ""
+        } else {
+            platform_methods
+                .map(|methods| methods.method_name_or_empty(&interface, event.code))
+                .unwrap_or("")
+        };
+
+        Self { interface, method }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -774,21 +895,4 @@ fn frequency_entries(state: &TuiState) -> Vec<FrequencyEntry> {
             .then_with(|| left.label.cmp(&right.label))
     });
     entries
-}
-
-fn event_bytes(event: &BinderEvent) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(72);
-    bytes.extend_from_slice(&event.sequence.to_le_bytes());
-    bytes.extend_from_slice(&event.timestamp_ns.to_le_bytes());
-    bytes.extend_from_slice(&event.kind.to_le_bytes());
-    bytes.extend_from_slice(&event.pid.to_le_bytes());
-    bytes.extend_from_slice(&event.tgid.to_le_bytes());
-    bytes.extend_from_slice(&event.uid.to_le_bytes());
-    bytes.extend_from_slice(&event.reply.to_le_bytes());
-    bytes.extend_from_slice(&event.lost_before.to_le_bytes());
-    bytes.extend_from_slice(&event.transaction.to_le_bytes());
-    bytes.extend_from_slice(&event.proc.to_le_bytes());
-    bytes.extend_from_slice(&event.thread.to_le_bytes());
-    bytes.extend_from_slice(&event.extra_buffers_size.to_le_bytes());
-    bytes
 }

@@ -16,9 +16,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 use std::time::Duration;
 
+use bt_common::MAX_INLINE_PAYLOAD;
 use thiserror::Error;
 
-const BT_ABI_VERSION: u32 = 1;
+const BT_ABI_VERSION: u32 = 2;
 const BT_IOC_MAGIC: u32 = b'B' as u32;
 const BT_DRIVER_FEATURE_MAGIC: u64 = 0x4254_5241_4345_3031;
 const BT_FEATURE_EVENT_STREAM: u32 = 1 << 1;
@@ -197,6 +198,17 @@ pub struct BinderEvent {
     pub proc: u64,
     pub thread: u64,
     pub extra_buffers_size: u64,
+    pub code: u32,
+    pub flags: u32,
+    pub data_size: u64,
+    pub offsets_size: u64,
+    pub target_handle: u32,
+    pub sender_pid: u32,
+    pub sender_euid: u32,
+    pub payload_len: u32,
+    pub payload_truncated: u8,
+    pub reserved: [u8; 7],
+    pub payload: [u8; MAX_INLINE_PAYLOAD],
 }
 
 impl BinderEvent {
@@ -206,6 +218,11 @@ impl BinderEvent {
 
     pub const fn is_reply(&self) -> bool {
         self.reply != 0
+    }
+
+    pub fn payload_bytes(&self) -> &[u8] {
+        let payload_len = (self.payload_len as usize).min(MAX_INLINE_PAYLOAD);
+        &self.payload[..payload_len]
     }
 }
 
@@ -429,7 +446,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<DriverFeature>(), 32);
         assert_eq!(std::mem::size_of::<CaptureConfig>(), 48);
         assert_eq!(std::mem::size_of::<CaptureStats>(), 40);
-        assert_eq!(std::mem::size_of::<BinderEvent>(), 72);
+        assert_eq!(std::mem::size_of::<BinderEvent>(), 376);
     }
 
     #[test]
