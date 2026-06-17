@@ -8,3 +8,4 @@ name = "bt_decoder"
 
 [dependencies]
 bt-common = { path = "../bt-common" }
+csv = "1.4.0"

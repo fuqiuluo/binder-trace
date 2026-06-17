@@ -40,7 +40,7 @@ impl AndroidPlatformMethods {
     /// 查询平台 Binder 方法；非平台接口、未知 code 或不支持的 SDK 返回 `None`。
     pub fn lookup(self, interface: &str, code: u32) -> Option<AndroidPlatformMethod> {
         let sdk_mask = sdk_mask(self.sdk)?;
-        let entries = android_platform_methods::ANDROID_PLATFORM_METHODS;
+        let entries = android_platform_methods::android_platform_methods();
         let start = entries.partition_point(|entry| entry.is_before(interface, code));
 
         entries
@@ -49,9 +49,9 @@ impl AndroidPlatformMethods {
             .take_while(|entry| entry.same_key(interface, code))
             .find(|entry| entry.matches_sdk(sdk_mask))
             .map(|entry| AndroidPlatformMethod {
-                interface: entry.interface,
+                interface: entry.interface.as_str(),
                 code: entry.code,
-                method: entry.method,
+                method: entry.method.as_str(),
             })
     }
 
@@ -74,17 +74,17 @@ pub fn parse_interface_token(payload: &[u8]) -> Option<String> {
         .filter(|token| is_interface_descriptor(token))
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct PlatformMethodEntry {
     pub(super) sdk_mask: u16,
-    pub(super) interface: &'static str,
+    pub(super) interface: String,
     pub(super) code: u32,
-    pub(super) method: &'static str,
+    pub(super) method: String,
 }
 
 impl PlatformMethodEntry {
     fn is_before(&self, interface: &str, code: u32) -> bool {
-        self.interface < interface || (self.interface == interface && self.code < code)
+        self.interface.as_str() < interface || (self.interface == interface && self.code < code)
     }
 
     fn same_key(&self, interface: &str, code: u32) -> bool {
