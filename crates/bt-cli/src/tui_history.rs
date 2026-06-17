@@ -159,6 +159,7 @@ impl CaptureHistory {
     }
 
     /// 从历史文件读取一个显示窗口。
+    #[cfg(test)]
     pub fn load_window(&self, start: u64, limit: usize) -> Result<Vec<BinderEvent>, HistoryError> {
         let start = start.min(self.count);
         let count = self.count.saturating_sub(start).min(limit as u64) as usize;

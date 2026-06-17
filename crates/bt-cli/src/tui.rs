@@ -5,7 +5,7 @@
 //! - 通过 alternate screen 和原地覆盖降低 adb shell 下的闪烁。
 //! - 处理捕获开关、清空、滚动和退出等键盘交互。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::future;
@@ -27,13 +27,12 @@ use crate::tui_history::{CaptureHistory, HistoryError};
 mod theme {
     use std::fmt;
 
-    use anstyle::{Ansi256Color, AnsiColor, Color, Style};
+    use anstyle::{Ansi256Color, AnsiColor, Color, RgbColor, Style};
 
-    pub const BORDER: Style = ansi256_fg(120);
-    pub const TRANSACTION_SEND: Style = ansi256_fg(51);
-    pub const TRANSACTION_REPLY: Style = ansi256_fg(226);
-    pub const FREQUENCY: Style = ansi256_fg(120);
-    pub const FREQUENCY_CODE: Style = ansi256_fg(226);
+    pub const BORDER: Style = ansi256_fg(15);
+    pub const FOCUSED_BORDER: Style = ansi256_fg(120);
+    pub const FREQUENCY: Style = rgb_fg(176, 223, 226);
+    pub const FREQUENCY_SELECTED: Style = black_on_rgb(176, 223, 226);
     pub const MUTED: Style = Style::new().dimmed();
     pub const TITLE: Style = Style::new().bold();
     pub const SELECTED: Style = Style::new()
@@ -43,6 +42,26 @@ mod theme {
 
     const fn ansi256_fg(index: u8) -> Style {
         Style::new().fg_color(Some(Color::Ansi256(Ansi256Color(index))))
+    }
+
+    const fn rgb_fg(red: u8, green: u8, blue: u8) -> Style {
+        Style::new().fg_color(Some(Color::Rgb(RgbColor(red, green, blue))))
+    }
+
+    const fn black_on_rgb(red: u8, green: u8, blue: u8) -> Style {
+        Style::new()
+            .fg_color(Some(Color::Ansi(AnsiColor::Black)))
+            .bg_color(Some(Color::Rgb(RgbColor(red, green, blue))))
+    }
+
+    pub fn ansi256_fg_style(index: u8) -> Style {
+        ansi256_fg(index)
+    }
+
+    pub fn black_on_ansi256(index: u8) -> Style {
+        Style::new()
+            .fg_color(Some(Color::Ansi(AnsiColor::Black)))
+            .bg_color(Some(Color::Ansi256(Ansi256Color(index))))
     }
 
     pub fn paint(style: Style, text: impl fmt::Display) -> String {
@@ -99,9 +118,9 @@ impl From<HistoryError> for TuiError {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum UiCommand {
     Quit,
-    ToggleRecording,
+    Space,
     Clear,
-    Help,
+    NextPane,
     Up,
     Down,
     PageUp,
@@ -110,19 +129,56 @@ enum UiCommand {
     End,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum FocusPane {
+    Transactions,
+    Frequency,
+    Hexdump,
+    Parsed,
+}
+
+impl FocusPane {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Transactions => "Transactions",
+            Self::Frequency => "Frequency",
+            Self::Hexdump => "Hexdump",
+            Self::Parsed => "Parsed Transaction",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Transactions => Self::Frequency,
+            Self::Frequency => Self::Hexdump,
+            Self::Hexdump => Self::Parsed,
+            Self::Parsed => Self::Transactions,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DisplayEvent {
+    history_index: u64,
+    event: BinderEvent,
+}
+
 #[derive(Debug)]
 struct TuiState {
     family: i32,
     capacity: usize,
-    events: VecDeque<BinderEvent>,
-    window_start: u64,
+    events: VecDeque<DisplayEvent>,
     selected: u64,
     total_events: u64,
     frequency_counts: BTreeMap<FrequencyKey, u64>,
     frequency_counted_events: u64,
+    disabled_frequency: BTreeSet<FrequencyKey>,
+    frequency_selected: usize,
+    hexdump_scroll: usize,
+    parsed_scroll: usize,
     stats: CaptureStats,
     recording: bool,
-    help_visible: bool,
+    focus: FocusPane,
     input_available: bool,
     android_sdk: Option<u16>,
     platform_methods: Option<AndroidPlatformMethods>,
@@ -143,14 +199,17 @@ impl TuiState {
             family,
             capacity: capacity.max(1),
             events: VecDeque::with_capacity(capacity.max(1)),
-            window_start: 0,
             selected: 0,
             total_events: 0,
             frequency_counts: BTreeMap::new(),
             frequency_counted_events: 0,
+            disabled_frequency: BTreeSet::new(),
+            frequency_selected: 0,
+            hexdump_scroll: 0,
+            parsed_scroll: 0,
             stats,
             recording: true,
-            help_visible: false,
+            focus: FocusPane::Transactions,
             input_available,
             android_sdk,
             platform_methods: android_sdk.map(AndroidPlatformMethods::new),
@@ -160,29 +219,94 @@ impl TuiState {
     }
 
     fn push_event(&mut self, history_index: u64, event: BinderEvent) {
-        let follows_tail = self.total_events == 0 || self.selected + 1 >= self.total_events;
+        let follows_tail = self
+            .events
+            .back()
+            .map(|entry| self.selected == entry.history_index)
+            .unwrap_or(true);
         self.total_events = history_index + 1;
 
-        if !follows_tail {
+        if !follows_tail || !self.displays_event(&event) {
             return;
-        }
-
-        if self.events.is_empty() {
-            self.window_start = history_index;
-        }
-
-        if self.window_start + self.events.len() as u64 != history_index {
-            self.events.clear();
-            self.window_start = history_index;
         }
 
         if self.events.len() == self.capacity {
             self.events.pop_front();
-            self.window_start += 1;
         }
 
-        self.events.push_back(event);
+        self.events.push_back(DisplayEvent {
+            history_index,
+            event,
+        });
         self.selected = history_index;
+        self.hexdump_scroll = 0;
+        self.parsed_scroll = 0;
+    }
+
+    fn focus_next(&mut self) {
+        self.focus = self.focus.next();
+    }
+
+    fn disable_selected_frequency(&mut self) -> bool {
+        let entries = frequency_entries(self);
+        let Some(entry) = entries
+            .get(self.frequency_selected.min(entries.len().saturating_sub(1)))
+            .cloned()
+        else {
+            return false;
+        };
+
+        self.disabled_frequency.insert(entry.key())
+    }
+
+    fn displays_event(&self, event: &BinderEvent) -> bool {
+        let Some(key) = FrequencyKey::from_event(event, self.platform_methods) else {
+            return true;
+        };
+        !self.disabled_frequency.contains(&key)
+    }
+
+    fn move_focused(
+        &mut self,
+        command: UiCommand,
+        page_size: usize,
+        history: &CaptureHistory,
+    ) -> Result<(), TuiError> {
+        match self.focus {
+            FocusPane::Transactions => {
+                let previous = self.selected;
+                self.move_selection(command, page_size, history)?;
+                self.ensure_selected_loaded(history)?;
+                if self.selected != previous {
+                    self.hexdump_scroll = 0;
+                    self.parsed_scroll = 0;
+                }
+            }
+            FocusPane::Frequency => {
+                self.frequency_selected = move_index(
+                    self.frequency_selected,
+                    command,
+                    page_size,
+                    self.frequency_counts.len(),
+                );
+            }
+            FocusPane::Hexdump => {
+                let lines = self
+                    .selected_event()
+                    .map(|event| event.payload_bytes().len().div_ceil(16))
+                    .unwrap_or_default();
+                self.hexdump_scroll = move_index(self.hexdump_scroll, command, page_size, lines);
+            }
+            FocusPane::Parsed => {
+                let lines = self
+                    .selected_event()
+                    .map(|_| PARSED_LINE_COUNT)
+                    .unwrap_or_default();
+                self.parsed_scroll = move_index(self.parsed_scroll, command, page_size, lines);
+            }
+        }
+
+        Ok(())
     }
 
     fn sync_frequency_counts(&mut self, history: &CaptureHistory) -> Result<(), TuiError> {
@@ -199,33 +323,80 @@ impl TuiState {
 
     fn clear(&mut self) {
         self.events.clear();
-        self.window_start = self.total_events;
         self.selected = self.total_events.saturating_sub(1);
+        self.frequency_selected = 0;
+        self.hexdump_scroll = 0;
+        self.parsed_scroll = 0;
     }
 
     fn selected_event(&self) -> Option<&BinderEvent> {
-        let offset = self.selected.checked_sub(self.window_start)?;
-        self.events.get(offset as usize)
+        self.events
+            .iter()
+            .find(|entry| entry.history_index == self.selected)
+            .map(|entry| &entry.event)
     }
 
-    fn move_selection(&mut self, command: UiCommand, page_size: usize) {
-        if self.total_events == 0 {
+    fn move_selection(
+        &mut self,
+        command: UiCommand,
+        page_size: usize,
+        history: &CaptureHistory,
+    ) -> Result<(), TuiError> {
+        if history.event_count() == 0 {
             self.selected = 0;
-            return;
+            return Ok(());
         }
 
-        let last = self.total_events - 1;
-        self.selected = match command {
-            UiCommand::Up => self.selected.saturating_sub(1),
-            UiCommand::Down => (self.selected + 1).min(last),
-            UiCommand::PageUp => self.selected.saturating_sub(page_size.max(1) as u64),
-            UiCommand::PageDown => (self.selected + page_size.max(1) as u64).min(last),
-            UiCommand::Home => 0,
-            UiCommand::End => last,
-            UiCommand::Quit | UiCommand::ToggleRecording | UiCommand::Clear | UiCommand::Help => {
-                self.selected
+        let page_size = page_size.max(1);
+        match command {
+            UiCommand::Up => {
+                if let Some(index) =
+                    self.previous_visible(history, self.selected.saturating_sub(1))?
+                {
+                    self.selected = index;
+                }
             }
-        };
+            UiCommand::Down => {
+                if let Some(index) = self.next_visible(history, self.selected.saturating_add(1))? {
+                    self.selected = index;
+                }
+            }
+            UiCommand::PageUp => {
+                for _ in 0..page_size {
+                    let Some(index) =
+                        self.previous_visible(history, self.selected.saturating_sub(1))?
+                    else {
+                        break;
+                    };
+                    self.selected = index;
+                }
+            }
+            UiCommand::PageDown => {
+                for _ in 0..page_size {
+                    let Some(index) =
+                        self.next_visible(history, self.selected.saturating_add(1))?
+                    else {
+                        break;
+                    };
+                    self.selected = index;
+                }
+            }
+            UiCommand::Home => {
+                if let Some(index) = self.next_visible(history, 0)? {
+                    self.selected = index;
+                }
+            }
+            UiCommand::End => {
+                if let Some(index) =
+                    self.previous_visible(history, history.event_count().saturating_sub(1))?
+                {
+                    self.selected = index;
+                }
+            }
+            UiCommand::Quit | UiCommand::Space | UiCommand::Clear | UiCommand::NextPane => {}
+        }
+
+        Ok(())
     }
 
     fn ensure_selected_loaded(&mut self, history: &CaptureHistory) -> Result<(), TuiError> {
@@ -233,20 +404,113 @@ impl TuiState {
             return Ok(());
         }
 
-        let capacity = self.capacity as u64;
-        let half_window = capacity / 2;
-        let max_start = self.total_events.saturating_sub(capacity);
-        let start = self.selected.saturating_sub(half_window).min(max_start);
-        let events = history.load_window(start, self.capacity)?;
-
-        self.window_start = start;
-        self.events = VecDeque::from(events);
+        self.reload_visible_window(history)?;
         Ok(())
     }
 
     fn selection_is_loaded(&self) -> bool {
-        let window_end = self.window_start + self.events.len() as u64;
-        self.selected >= self.window_start && self.selected < window_end
+        self.events
+            .iter()
+            .any(|entry| entry.history_index == self.selected)
+    }
+
+    fn reload_visible_window(&mut self, history: &CaptureHistory) -> Result<(), TuiError> {
+        self.events.clear();
+        if history.event_count() == 0 {
+            return Ok(());
+        }
+
+        let start = self.selected.saturating_sub((self.capacity / 2) as u64);
+        for index in start..history.event_count() {
+            let event = history.event_at(index)?;
+            if self.displays_event(&event) {
+                self.events.push_back(DisplayEvent {
+                    history_index: index,
+                    event,
+                });
+                if self.events.len() == self.capacity {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn select_nearest_visible(&mut self, history: &CaptureHistory) -> Result<(), TuiError> {
+        if history.event_count() == 0 {
+            self.selected = 0;
+            self.events.clear();
+            return Ok(());
+        }
+
+        if self.selected < history.event_count()
+            && self.displays_event(&history.event_at(self.selected)?)
+        {
+            return Ok(());
+        }
+
+        if let Some(index) = self.next_visible(history, self.selected.saturating_add(1))? {
+            self.selected = index;
+        } else if let Some(index) =
+            self.previous_visible(history, self.selected.saturating_sub(1))?
+        {
+            self.selected = index;
+        } else {
+            self.selected = 0;
+        }
+
+        self.hexdump_scroll = 0;
+        self.parsed_scroll = 0;
+        Ok(())
+    }
+
+    fn next_visible(&self, history: &CaptureHistory, start: u64) -> Result<Option<u64>, TuiError> {
+        for index in start..history.event_count() {
+            let event = history.event_at(index)?;
+            if self.displays_event(&event) {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    fn previous_visible(
+        &self,
+        history: &CaptureHistory,
+        start: u64,
+    ) -> Result<Option<u64>, TuiError> {
+        if history.event_count() == 0 {
+            return Ok(None);
+        }
+
+        let start = start.min(history.event_count() - 1);
+        for index in (0..=start).rev() {
+            let event = history.event_at(index)?;
+            if self.displays_event(&event) {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn move_index(current: usize, command: UiCommand, page_size: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let last = len - 1;
+    match command {
+        UiCommand::Up => current.saturating_sub(1),
+        UiCommand::Down => (current + 1).min(last),
+        UiCommand::PageUp => current.saturating_sub(page_size.max(1)),
+        UiCommand::PageDown => (current + page_size.max(1)).min(last),
+        UiCommand::Home => 0,
+        UiCommand::End => last,
+        UiCommand::Quit | UiCommand::Space | UiCommand::Clear | UiCommand::NextPane => {
+            current.min(last)
+        }
     }
 }
 
@@ -409,21 +673,20 @@ fn drain_input_commands(
         loop {
             match input.read_command() {
                 Ok(Some(UiCommand::Quit)) => return Ok(true),
-                Ok(Some(UiCommand::ToggleRecording)) => {
-                    toggle_recording(client, state, capture_config)?;
+                Ok(Some(UiCommand::Space)) => {
+                    handle_space(client, state, capture_config, history)?;
                     *dirty = true;
                 }
                 Ok(Some(UiCommand::Clear)) => {
                     state.clear();
                     *dirty = true;
                 }
-                Ok(Some(UiCommand::Help)) => {
-                    state.help_visible = !state.help_visible;
+                Ok(Some(UiCommand::NextPane)) => {
+                    state.focus_next();
                     *dirty = true;
                 }
                 Ok(Some(command)) => {
-                    state.move_selection(command, 10);
-                    state.ensure_selected_loaded(history)?;
+                    state.move_focused(command, 10, history)?;
                     *dirty = true;
                 }
                 Ok(None) => break,
@@ -509,6 +772,25 @@ impl Drop for CaptureGuard<'_> {
         if self.owns_capture {
             let _ = self.client.set_config(CaptureConfig::disabled());
         }
+    }
+}
+
+fn handle_space(
+    client: &SocketIpcClient,
+    state: &mut TuiState,
+    capture_config: Option<CaptureConfig>,
+    history: &CaptureHistory,
+) -> Result<(), TuiError> {
+    match state.focus {
+        FocusPane::Transactions => toggle_recording(client, state, capture_config),
+        FocusPane::Frequency => {
+            if state.disable_selected_frequency() {
+                state.select_nearest_visible(history)?;
+                state.reload_visible_window(history)?;
+            }
+            Ok(())
+        }
+        FocusPane::Hexdump | FocusPane::Parsed => Ok(()),
     }
 }
 
@@ -600,9 +882,9 @@ impl KeyParser {
         if self.escape.is_empty() {
             return match byte {
                 b'q' | 0x03 => Some(UiCommand::Quit),
-                b' ' => Some(UiCommand::ToggleRecording),
+                b' ' => Some(UiCommand::Space),
                 b'c' => Some(UiCommand::Clear),
-                b'h' => Some(UiCommand::Help),
+                b'\t' => Some(UiCommand::NextPane),
                 0x1b => {
                     self.escape.push(byte);
                     None
@@ -734,16 +1016,17 @@ fn render(out: &mut Stdout, state: &TuiState) -> io::Result<()> {
 
 fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<String> {
     render_panel(
-        "Transactions",
+        FocusPane::Transactions.title(),
+        state.focus == FocusPane::Transactions,
         width,
         height,
         |inner_width, inner_height| {
             let mut lines = Vec::with_capacity(inner_height);
             let visible_rows = inner_height.saturating_sub(1);
             let selected_offset = state
-                .selected
-                .checked_sub(state.window_start)
-                .map(|offset| offset as usize)
+                .events
+                .iter()
+                .position(|entry| entry.history_index == state.selected)
                 .unwrap_or_default();
             let start = if selected_offset >= visible_rows {
                 selected_offset + 1 - visible_rows
@@ -752,9 +1035,10 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
             };
             let rows = (start..state.events.len().min(start + visible_rows))
                 .map(|index| {
-                    let event = &state.events[index];
+                    let entry = &state.events[index];
+                    let event = &entry.event;
                     let summary = TransactionSummary::new(event, state.platform_methods);
-                    (state.window_start + index as u64, event, summary)
+                    (entry.history_index, event, summary)
                 })
                 .collect::<Vec<_>>();
             let columns = TransactionColumns::new(
@@ -767,17 +1051,17 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
             for (history_index, event, summary) in rows {
                 let fitted = columns.row(
                     &event.sequence.to_string(),
+                    direction(event),
                     summary.interface.as_str(),
                     &event.code.to_string(),
                     summary.method,
                     &format!("0x{:x}", event.data_size),
                 );
+                let color = transaction_color_index(&summary, event);
                 if history_index == state.selected {
-                    lines.push(theme::paint(theme::SELECTED, fitted));
-                } else if event.is_reply() {
-                    lines.push(theme::paint(theme::TRANSACTION_REPLY, fitted));
+                    lines.push(theme::paint(theme::black_on_ansi256(color), fitted));
                 } else {
-                    lines.push(theme::paint(theme::TRANSACTION_SEND, fitted));
+                    lines.push(theme::paint(theme::ansi256_fg_style(color), fitted));
                 }
             }
 
@@ -790,6 +1074,7 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
 struct TransactionColumns {
     width: usize,
     sequence: usize,
+    direction: usize,
     interface: usize,
     code: usize,
     method: usize,
@@ -799,6 +1084,7 @@ struct TransactionColumns {
 impl TransactionColumns {
     fn new(width: usize, has_method: bool) -> Self {
         const SEQUENCE_WIDTH: usize = 8;
+        const DIRECTION_WIDTH: usize = 5;
         const CODE_WIDTH: usize = 10;
         const LEN_WIDTH: usize = 8;
         const MIN_INTERFACE_WIDTH: usize = 18;
@@ -806,10 +1092,12 @@ impl TransactionColumns {
         const MIN_METHOD_WIDTH: usize = 12;
         const MAX_METHOD_WIDTH: usize = 28;
 
-        let gap_width = if has_method { 4 } else { 3 };
+        let gap_width = if has_method { 5 } else { 4 };
         let available = width.saturating_sub(gap_width);
         let sequence = SEQUENCE_WIDTH.min(available);
         let remaining = available.saturating_sub(sequence);
+        let direction = DIRECTION_WIDTH.min(remaining);
+        let remaining = remaining.saturating_sub(direction);
         let code = CODE_WIDTH.min(remaining);
         let remaining = remaining.saturating_sub(code);
         let len = LEN_WIDTH.min(remaining);
@@ -829,6 +1117,7 @@ impl TransactionColumns {
         Self {
             width,
             sequence,
+            direction,
             interface,
             code,
             method,
@@ -837,22 +1126,32 @@ impl TransactionColumns {
     }
 
     fn header(self) -> String {
-        self.row("Seq", "Interface", "#", "Method", "Len")
+        self.row("Seq", "Dir", "Interface", "#", "Method", "Len")
     }
 
-    fn row(self, sequence: &str, interface: &str, code: &str, method: &str, len: &str) -> String {
+    fn row(
+        self,
+        sequence: &str,
+        direction: &str,
+        interface: &str,
+        code: &str,
+        method: &str,
+        len: &str,
+    ) -> String {
         let line = if self.method == 0 {
             format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
                 fit_right(sequence, self.sequence),
+                fit(direction, self.direction),
                 fit(interface, self.interface),
                 fit_right(code, self.code),
                 fit_right(len, self.len),
             )
         } else {
             format!(
-                "{} {} {} {} {}",
+                "{} {} {} {} {} {}",
                 fit_right(sequence, self.sequence),
+                fit(direction, self.direction),
                 fit(interface, self.interface),
                 fit_right(code, self.code),
                 fit(method, self.method),
@@ -863,21 +1162,75 @@ impl TransactionColumns {
     }
 }
 
+const TRANSACTION_COLORS: &[u8] = &[
+    39, 45, 51, 81, 87, 111, 117, 123, 159, 177, 183, 189, 204, 207, 213, 219, 222, 228,
+];
+
+fn transaction_color_index(summary: &TransactionSummary, event: &BinderEvent) -> u8 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    if summary.interface.is_empty() {
+        hash = fnv1a(hash, b"<reply>");
+        hash = fnv1a(hash, &event.code.to_le_bytes());
+    } else {
+        hash = fnv1a(hash, summary.interface.as_bytes());
+    }
+
+    TRANSACTION_COLORS[(hash as usize) % TRANSACTION_COLORS.len()]
+}
+
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn render_frequency(state: &TuiState, width: usize, height: usize) -> Vec<String> {
-    render_panel("Frequency", width, height, |inner_width, inner_height| {
-        let columns = FrequencyColumns::new(inner_width);
-        let mut lines = Vec::with_capacity(inner_height);
-        lines.push(theme::paint(theme::MUTED, columns.header()));
+    render_panel(
+        FocusPane::Frequency.title(),
+        state.focus == FocusPane::Frequency,
+        width,
+        height,
+        |inner_width, inner_height| {
+            let columns = FrequencyColumns::new(inner_width);
+            let entries = frequency_entries(state);
+            let visible_rows = inner_height.saturating_sub(1);
+            let selected = state
+                .frequency_selected
+                .min(entries.len().saturating_sub(1));
+            let start = visible_start(selected, visible_rows, entries.len());
+            let mut lines = Vec::with_capacity(inner_height);
+            lines.push(theme::paint(theme::MUTED, columns.header()));
 
-        for entry in frequency_entries(state)
-            .into_iter()
-            .take(inner_height.saturating_sub(1))
-        {
-            lines.push(columns.styled_row(&entry, "[+]"));
-        }
+            for (index, entry) in entries
+                .into_iter()
+                .enumerate()
+                .skip(start)
+                .take(inner_height.saturating_sub(1))
+            {
+                let filter = if state.disabled_frequency.contains(&entry.key()) {
+                    "off"
+                } else {
+                    "on"
+                };
+                lines.push(columns.styled_row(&entry, filter, index == selected));
+            }
 
-        lines
-    })
+            lines
+        },
+    )
+}
+
+fn visible_start(selected: usize, visible_rows: usize, len: usize) -> usize {
+    if visible_rows == 0 || len <= visible_rows {
+        return 0;
+    }
+    if selected >= visible_rows {
+        (selected + 1 - visible_rows).min(len - visible_rows)
+    } else {
+        0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -922,26 +1275,42 @@ impl FrequencyColumns {
         fit(&line, self.width)
     }
 
-    fn styled_row(self, entry: &FrequencyEntry, filter: &str) -> String {
+    fn styled_row(self, entry: &FrequencyEntry, filter: &str, selected: bool) -> String {
+        let count = fit_right(&entry.count.to_string(), self.count);
+        let filter = fit_right(filter, self.filter);
+        if selected {
+            let separator = theme::paint(theme::FREQUENCY_SELECTED, " ");
+            return format!(
+                "{}{}{}{}{}",
+                self.styled_label(entry, true),
+                separator,
+                theme::paint(theme::FREQUENCY_SELECTED, count),
+                separator,
+                theme::paint(theme::FREQUENCY_SELECTED, filter),
+            );
+        }
+
         format!(
             "{} {} {}",
-            self.styled_label(entry),
-            theme::paint(
-                theme::FREQUENCY,
-                fit_right(&entry.count.to_string(), self.count)
-            ),
-            theme::paint(theme::FREQUENCY, fit_right(filter, self.filter)),
+            self.styled_label(entry, false),
+            theme::paint(theme::FREQUENCY, count),
+            theme::paint(theme::FREQUENCY, filter),
         )
     }
 
-    fn styled_label(self, entry: &FrequencyEntry) -> String {
+    fn styled_label(self, entry: &FrequencyEntry, selected: bool) -> String {
         let code = format!("#{}", entry.code);
         let code_width = code.chars().count();
+        let label_style = if selected {
+            theme::FREQUENCY_SELECTED
+        } else {
+            theme::FREQUENCY
+        };
         if self.label == 0 {
             return String::new();
         }
         if code_width >= self.label {
-            return theme::paint(theme::FREQUENCY_CODE, fit(&code, self.label));
+            return theme::paint(label_style, fit(&code, self.label));
         }
 
         let interface = truncate_with_ellipsis(&entry.interface, self.label - code_width);
@@ -950,56 +1319,67 @@ impl FrequencyColumns {
             .saturating_sub(interface.chars().count() + code_width);
         format!(
             "{}{}{}",
-            theme::paint(theme::FREQUENCY, interface),
-            theme::paint(theme::FREQUENCY_CODE, code),
-            theme::paint(theme::FREQUENCY, " ".repeat(padding)),
+            theme::paint(label_style, interface),
+            theme::paint(label_style, code),
+            theme::paint(label_style, " ".repeat(padding)),
         )
     }
 }
 
 fn render_hexdump(state: &TuiState, width: usize, height: usize) -> Vec<String> {
-    render_panel("Hexdump", width, height, |inner_width, inner_height| {
-        let Some(event) = state.selected_event() else {
-            return vec![dim_line("等待 binder_transaction 事件", inner_width)];
-        };
-
-        let bytes = event.payload_bytes();
-        if bytes.is_empty() {
-            return vec![dim_line("payload 为空或未捕获", inner_width)];
-        }
-
-        bytes
-            .chunks(16)
-            .take(inner_height)
-            .enumerate()
-            .map(|(row, chunk)| {
-                let mut hex = String::new();
-                let mut ascii = String::new();
-                for byte in chunk {
-                    hex.push_str(&format!("{byte:02x} "));
-                    ascii.push(if byte.is_ascii_graphic() {
-                        char::from(*byte)
-                    } else {
-                        '.'
-                    });
-                }
-                let line = format!("{:04x}  {:<48}  {}", row * 16, hex, ascii);
-                fit(&line, inner_width)
-            })
-            .collect()
-    })
-}
-
-fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
     render_panel(
-        "Parsed Transaction",
+        FocusPane::Hexdump.title(),
+        state.focus == FocusPane::Hexdump,
         width,
         height,
         |inner_width, inner_height| {
-            if state.help_visible {
-                return help_lines(inner_width, inner_height);
+            let Some(event) = state.selected_event() else {
+                return vec![dim_line("等待 binder_transaction 事件", inner_width)];
+            };
+
+            let bytes = event.payload_bytes();
+            if bytes.is_empty() {
+                return vec![dim_line("payload 为空或未捕获", inner_width)];
             }
 
+            bytes
+                .chunks(16)
+                .skip(state.hexdump_scroll)
+                .take(inner_height)
+                .enumerate()
+                .map(|(row, chunk)| {
+                    let mut hex = String::new();
+                    let mut ascii = String::new();
+                    for byte in chunk {
+                        hex.push_str(&format!("{byte:02x} "));
+                        ascii.push(if byte.is_ascii_graphic() {
+                            char::from(*byte)
+                        } else {
+                            '.'
+                        });
+                    }
+                    let line = format!(
+                        "{:04x}  {:<48}  {}",
+                        (state.hexdump_scroll + row) * 16,
+                        hex,
+                        ascii
+                    );
+                    fit(&line, inner_width)
+                })
+                .collect()
+        },
+    )
+}
+
+const PARSED_LINE_COUNT: usize = 20;
+
+fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
+    render_panel(
+        FocusPane::Parsed.title(),
+        state.focus == FocusPane::Parsed,
+        width,
+        height,
+        |inner_width, inner_height| {
             let Some(event) = state.selected_event() else {
                 return vec![dim_line("选择事件后显示解析结果", inner_width)];
             };
@@ -1041,8 +1421,9 @@ fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
 
             lines
                 .into_iter()
-                .take(inner_height)
                 .enumerate()
+                .skip(state.parsed_scroll)
+                .take(inner_height)
                 .map(|(index, line)| {
                     if index == 0 {
                         line
@@ -1055,29 +1436,13 @@ fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
     )
 }
 
-fn help_lines(width: usize, height: usize) -> Vec<String> {
-    [
-        "q / Ctrl-C     quit",
-        "space          toggle kernel capture",
-        "c              clear captured rows",
-        "h              toggle this help pane",
-        "up/down        move selection",
-        "page up/down   scroll selection faster",
-        "home/end       jump to first/last row",
-    ]
-    .into_iter()
-    .take(height)
-    .map(|line| fit(line, width))
-    .collect()
-}
-
 fn render_status(state: &TuiState, width: usize) -> [String; 2] {
     let selected = if state.total_events == 0 {
         "0/0".to_owned()
     } else {
         format!("{}/{}", state.selected + 1, state.total_events)
     };
-    let window_end = state.window_start + state.events.len() as u64;
+    let (window_start, window_end) = visible_window_bounds(state);
     let uptime = state.start.elapsed().as_secs();
     let recording = if state.recording { "True" } else { "False" };
     let input = if state.input_available {
@@ -1090,12 +1455,13 @@ fn render_status(state: &TuiState, width: usize) -> [String; 2] {
         .map(|sdk| sdk.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     let status_text = format!(
-        "Family: {}  SDK: {}  Transactions: {}  Saved: {}  Window: {}-{}  History: {}  Recording: {}  Input: {}  Selected: {}  Uptime: {}s",
+        "Family: {}  SDK: {}  Focus: {}  Transactions: {}  Saved: {}  Window: {}-{}  History: {}  Recording: {}  Input: {}  Selected: {}  Uptime: {}s",
         state.family,
         sdk,
+        state.focus.title(),
         state.stats.captured,
         state.total_events,
-        state.window_start,
+        window_start,
         window_end,
         state.history_path.display(),
         recording,
@@ -1103,16 +1469,55 @@ fn render_status(state: &TuiState, width: usize) -> [String; 2] {
         selected,
         uptime
     );
-    let key_text = "Keys: q=quit  h=help  space=toggle  c=clear  up/down=move  page up/down=page  home/end=jump";
+    let key_text = key_hints(state);
 
     [
         theme::paint(theme::STATUS, fit(&status_text, width)),
-        theme::paint(theme::MUTED, fit(key_text, width)),
+        theme::paint(theme::MUTED, fit(&key_text, width)),
     ]
+}
+
+fn visible_window_bounds(state: &TuiState) -> (u64, u64) {
+    let start = state
+        .events
+        .front()
+        .map(|entry| entry.history_index)
+        .unwrap_or_default();
+    let end = state
+        .events
+        .back()
+        .map(|entry| entry.history_index + 1)
+        .unwrap_or(start);
+    (start, end)
+}
+
+fn key_hints(state: &TuiState) -> String {
+    match state.focus {
+        FocusPane::Transactions => {
+            let space = if state.recording {
+                "space=pause capture"
+            } else {
+                "space=resume capture"
+            };
+            format!(
+                "Keys: tab=focus  q=quit  {space}  c=clear  up/down=move transaction  page up/down=page  home/end=jump"
+            )
+        }
+        FocusPane::Frequency => {
+            "Keys: tab=focus  q=quit  space=disable interface/code  c=clear  up/down=move frequency  page up/down=page  home/end=jump".to_owned()
+        }
+        FocusPane::Hexdump => {
+            "Keys: tab=focus  q=quit  c=clear  up/down=scroll hexdump  page up/down=page  home/end=jump".to_owned()
+        }
+        FocusPane::Parsed => {
+            "Keys: tab=focus  q=quit  c=clear  up/down=scroll parsed  page up/down=page  home/end=jump".to_owned()
+        }
+    }
 }
 
 fn render_panel(
     title: &str,
+    focused: bool,
     width: usize,
     height: usize,
     body: impl FnOnce(usize, usize) -> Vec<String>,
@@ -1122,48 +1527,57 @@ fn render_panel(
     let inner_width = width.saturating_sub(2);
     let inner_height = height.saturating_sub(2);
     let mut lines = Vec::with_capacity(height);
+    let border_style = if focused {
+        theme::FOCUSED_BORDER
+    } else {
+        theme::BORDER
+    };
 
-    lines.push(top_border(title, width));
+    lines.push(top_border(title, width, focused, border_style));
     for line in body(inner_width, inner_height)
         .into_iter()
         .take(inner_height)
     {
         lines.push(format!(
             "{}{}{}",
-            theme::paint(theme::BORDER, "|"),
+            theme::paint(border_style, "│"),
             line,
-            theme::paint(theme::BORDER, "|")
+            theme::paint(border_style, "│")
         ));
     }
 
     while lines.len() + 1 < height {
         lines.push(format!(
             "{}{}{}",
-            theme::paint(theme::BORDER, "|"),
+            theme::paint(border_style, "│"),
             " ".repeat(inner_width),
-            theme::paint(theme::BORDER, "|")
+            theme::paint(border_style, "│")
         ));
     }
 
     lines.push(theme::paint(
-        theme::BORDER,
-        format!("+{}+", "-".repeat(inner_width)),
+        border_style,
+        format!("└{}┘", "─".repeat(inner_width)),
     ));
     lines
 }
 
-fn top_border(title: &str, width: usize) -> String {
+fn top_border(title: &str, width: usize, focused: bool, style: anstyle::Style) -> String {
     let inner_width = width.saturating_sub(2);
-    let title = format!(" {title} ");
+    let title = if focused {
+        format!(" [{title}] ")
+    } else {
+        format!(" {title} ")
+    };
     if title.len() >= inner_width {
-        return theme::paint(theme::BORDER, format!("+{}+", fit(&title, inner_width)));
+        return theme::paint(style, format!("┌{}┐", fit(&title, inner_width)));
     }
 
     let left = (inner_width - title.len()) / 2;
     let right = inner_width - title.len() - left;
     theme::paint(
-        theme::BORDER,
-        format!("+{}{}{}+", "-".repeat(left), title, "-".repeat(right)),
+        style,
+        format!("┌{}{}{}┐", "─".repeat(left), title, "─".repeat(right)),
     )
 }
 
@@ -1246,6 +1660,15 @@ struct FrequencyEntry {
     count: u64,
 }
 
+impl FrequencyEntry {
+    fn key(&self) -> FrequencyKey {
+        FrequencyKey {
+            interface: self.interface.clone(),
+            code: self.code,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct FrequencyKey {
     interface: String,
@@ -1303,8 +1726,9 @@ mod tests {
     use bt_decoder::AndroidPlatformMethods;
 
     use super::{
-        FrequencyColumns, FrequencyEntry, FrequencyKey, TransactionColumns, TuiState,
-        frequency_entries, render_status, truncate_with_ellipsis,
+        FocusPane, FrequencyColumns, FrequencyEntry, FrequencyKey, TransactionColumns,
+        TransactionSummary, TuiState, UiCommand, fit, frequency_entries, render_panel,
+        render_status, transaction_color_index, truncate_with_ellipsis, visible_window_bounds,
     };
     use crate::tui_history::CaptureHistory;
 
@@ -1323,6 +1747,7 @@ mod tests {
         for width in [6, 24, 65, 100] {
             let row = TransactionColumns::new(width, true).row(
                 "123456789",
+                "send",
                 "android.app.IActivityManager",
                 "1000000",
                 "someExtremelyLongMethodName",
@@ -1353,6 +1778,7 @@ mod tests {
         let columns = TransactionColumns::new(100, true);
         let row = columns.row(
             "1",
+            "reply",
             "android.content.pm.IPackageManager",
             "4294967295",
             "method",
@@ -1360,6 +1786,36 @@ mod tests {
         );
 
         assert!(row.contains("4294967295"));
+        assert!(row.contains("reply"));
+    }
+
+    #[test]
+    fn transaction_columns_include_direction_header() {
+        let columns = TransactionColumns::new(80, true);
+        let header = columns.header();
+        let row = columns.row("1", "send", "android.os.IMessenger", "1", "send", "0x20");
+
+        assert!(header.contains("Dir"));
+        assert!(row.contains("send"));
+    }
+
+    #[test]
+    fn transaction_color_is_derived_from_interface_name() {
+        let left_event = binder_event("android.os.IMessenger", 1, false);
+        let right_event = binder_event("android.os.IMessenger", 42, false);
+        let other_event = binder_event("android.app.IActivityManager", 1, false);
+        let left = TransactionSummary::new(&left_event, Some(AndroidPlatformMethods::new(34)));
+        let right = TransactionSummary::new(&right_event, Some(AndroidPlatformMethods::new(34)));
+        let other = TransactionSummary::new(&other_event, Some(AndroidPlatformMethods::new(34)));
+
+        assert_eq!(
+            transaction_color_index(&left, &left_event),
+            transaction_color_index(&right, &right_event)
+        );
+        assert_ne!(
+            transaction_color_index(&left, &left_event),
+            transaction_color_index(&other, &other_event)
+        );
     }
 
     #[test]
@@ -1384,6 +1840,55 @@ mod tests {
     }
 
     #[test]
+    fn frequency_disable_filters_display_without_dropping_history() {
+        let path = temp_path("frequency-disable");
+        let mut history = CaptureHistory::create(path.clone(), 4).expect("历史文件应可创建");
+        let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), path.clone());
+        let hidden = history
+            .append_for_test(binder_event("android.os.IMessenger", 1, false))
+            .expect("测试事件应可追加");
+        let visible = history
+            .append_for_test(binder_event("android.os.IMessenger", 2, false))
+            .expect("测试事件应可追加");
+        state.push_event(
+            hidden,
+            history.event_at(hidden).expect("隐藏事件应可从历史读取"),
+        );
+        state.push_event(
+            visible,
+            history.event_at(visible).expect("可见事件应可从历史读取"),
+        );
+        state.frequency_counts.insert(
+            FrequencyKey {
+                interface: "android.os.IMessenger".to_owned(),
+                code: 1,
+            },
+            4,
+        );
+
+        assert!(state.disable_selected_frequency());
+        state
+            .select_nearest_visible(&history)
+            .expect("过滤后应可重新选择可见事件");
+        state
+            .reload_visible_window(&history)
+            .expect("过滤后应可重载可见窗口");
+
+        assert_eq!(history.event_count(), 2);
+        assert_eq!(state.selected, visible);
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .map(|entry| entry.event.code)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn frequency_columns_keep_count_and_filter_aligned() {
         let columns = FrequencyColumns::new(52);
         let row = columns.row(
@@ -1398,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn frequency_styled_row_colors_code_separately() {
+    fn frequency_styled_row_uses_srgb_color() {
         let columns = FrequencyColumns::new(40);
         let entry = FrequencyEntry {
             label: "android.os.IFoo#18".to_owned(),
@@ -1406,17 +1911,38 @@ mod tests {
             code: 18,
             count: 7,
         };
-        let row = columns.styled_row(&entry, "[+]");
+        let row = columns.styled_row(&entry, "[+]", false);
         let plain = strip_ansi(&row);
 
-        assert!(row.contains("\x1b[38;5;226m#18"));
+        assert!(row.contains("\x1b[38;2;176;223;226mandroid.os.IFoo"));
+        assert!(row.contains("\x1b[38;2;176;223;226m#18"));
+        assert!(row.contains("\x1b[38;2;176;223;226m      7"));
+        assert!(!row.contains("38;5;176"));
         assert_eq!(plain.chars().count(), 40);
         assert!(plain.contains("android.os.IFoo#18"));
     }
 
     #[test]
+    fn frequency_selected_row_changes_text_colors() {
+        let columns = FrequencyColumns::new(40);
+        let entry = FrequencyEntry {
+            label: "android.os.IFoo#18".to_owned(),
+            interface: "android.os.IFoo".to_owned(),
+            code: 18,
+            count: 7,
+        };
+        let row = columns.styled_row(&entry, "[+]", true);
+        let plain = strip_ansi(&row);
+
+        assert!(row.contains("48;2;176;223;226"));
+        assert!(row.contains("38;5;0"));
+        assert!(!row.contains("48;5;176"));
+        assert_eq!(plain.chars().count(), 40);
+    }
+
+    #[test]
     fn status_bar_separates_state_from_key_hints() {
-        let state = TuiState::new(12, 16, empty_stats(), true, Some(34), temp_path("status"));
+        let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), temp_path("status"));
         let [status, keys] = render_status(&state, 96);
         let status = strip_ansi(&status);
         let keys = strip_ansi(&keys);
@@ -1425,7 +1951,119 @@ mod tests {
         assert_eq!(keys.chars().count(), 96);
         assert!(status.contains("Family: 12"));
         assert!(!status.contains("q=quit"));
-        assert!(keys.contains("Keys: q=quit"));
+        assert!(status.contains("Focus: Transactions"));
+        assert!(keys.contains("Keys: tab=focus"));
+        assert!(keys.contains("q=quit"));
+        assert!(keys.contains("space=pause capture"));
+        assert!(!keys.contains("h=help"));
+
+        state.focus = FocusPane::Frequency;
+        let keys = strip_ansi(&render_status(&state, 120)[1]);
+        assert!(keys.contains("space=disable interface/code"));
+        assert!(keys.contains("up/down=move frequency"));
+        assert!(!keys.contains("space=pause capture"));
+
+        state.focus = FocusPane::Hexdump;
+        let keys = strip_ansi(&render_status(&state, 120)[1]);
+        assert!(keys.contains("up/down=scroll hexdump"));
+        assert!(!keys.contains("space="));
+    }
+
+    #[test]
+    fn tab_focus_cycles_through_panels() {
+        let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), temp_path("focus"));
+
+        assert_eq!(state.focus, FocusPane::Transactions);
+        state.focus_next();
+        assert_eq!(state.focus, FocusPane::Frequency);
+        state.focus_next();
+        assert_eq!(state.focus, FocusPane::Hexdump);
+        state.focus_next();
+        assert_eq!(state.focus, FocusPane::Parsed);
+        state.focus_next();
+        assert_eq!(state.focus, FocusPane::Transactions);
+    }
+
+    #[test]
+    fn focused_frequency_navigation_does_not_move_transaction_selection() {
+        let path = temp_path("frequency-focus");
+        let history = CaptureHistory::create(path.clone(), 2).expect("历史文件应可创建");
+        let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), path.clone());
+        state.total_events = 8;
+        state.selected = 5;
+        state.focus = FocusPane::Frequency;
+        state.frequency_counts.insert(
+            FrequencyKey {
+                interface: "android.os.IFoo".to_owned(),
+                code: 1,
+            },
+            3,
+        );
+        state.frequency_counts.insert(
+            FrequencyKey {
+                interface: "android.os.IBar".to_owned(),
+                code: 2,
+            },
+            2,
+        );
+
+        state
+            .move_focused(UiCommand::Down, 10, &history)
+            .expect("频率焦点导航应成功");
+
+        assert_eq!(state.selected, 5);
+        assert_eq!(state.frequency_selected, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn focused_detail_navigation_scrolls_without_moving_transaction_selection() {
+        let path = temp_path("detail-focus");
+        let history = CaptureHistory::create(path.clone(), 2).expect("历史文件应可创建");
+        let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), path.clone());
+        let event = binder_event("android.os.IMessenger", 1, false);
+        state.push_event(0, event);
+
+        state.focus = FocusPane::Hexdump;
+        state
+            .move_focused(UiCommand::Down, 10, &history)
+            .expect("hexdump 焦点导航应成功");
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.hexdump_scroll, 1);
+
+        state.focus = FocusPane::Parsed;
+        state
+            .move_focused(UiCommand::Down, 10, &history)
+            .expect("parsed 焦点导航应成功");
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.parsed_scroll, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn focused_panel_uses_solid_green_border() {
+        let focused = render_panel("Frequency", true, 24, 3, |width, _| {
+            vec![fit("body", width)]
+        });
+        let unfocused = render_panel("Frequency", false, 24, 3, |width, _| {
+            vec![fit("body", width)]
+        });
+        let focused_top = strip_ansi(&focused[0]);
+        let unfocused_top = strip_ansi(&unfocused[0]);
+
+        assert!(focused[0].contains("\x1b[38;5;120m"));
+        assert!(unfocused[0].contains("\x1b[38;5;15m"));
+        assert!(focused_top.starts_with("┌"));
+        assert!(focused_top.contains("[Frequency]"));
+        assert!(focused_top.contains("─"));
+        assert!(focused[1].contains("│"));
+        assert!(focused[2].contains("└"));
+        assert!(!unfocused_top.contains("[Frequency]"));
+        assert!(unfocused_top.contains(" Frequency "));
+        assert!(!focused_top.contains("="));
+        assert!(!unfocused_top.contains("-"));
     }
 
     #[test]
@@ -1449,7 +2087,7 @@ mod tests {
             state
                 .events
                 .iter()
-                .map(|event| event.sequence)
+                .map(|entry| entry.event.sequence)
                 .collect::<Vec<_>>(),
             vec![3, 4]
         );
@@ -1472,13 +2110,13 @@ mod tests {
             state.push_event(sequence, event);
         }
 
-        assert_eq!(state.window_start, 3);
+        assert_eq!(visible_window_bounds(&state), (3, 6));
         assert_eq!(state.selected, 5);
         assert_eq!(
             state
                 .events
                 .iter()
-                .map(|event| event.sequence)
+                .map(|entry| entry.event.sequence)
                 .collect::<Vec<_>>(),
             vec![3, 4, 5]
         );
@@ -1505,7 +2143,7 @@ mod tests {
             state
                 .events
                 .iter()
-                .map(|event| event.sequence)
+                .map(|entry| entry.event.sequence)
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
@@ -1521,7 +2159,7 @@ mod tests {
             state
                 .events
                 .iter()
-                .map(|event| event.sequence)
+                .map(|entry| entry.event.sequence)
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
@@ -1534,7 +2172,7 @@ mod tests {
             state
                 .events
                 .iter()
-                .map(|event| event.sequence)
+                .map(|entry| entry.event.sequence)
                 .collect::<Vec<_>>(),
             vec![3, 4]
         );
