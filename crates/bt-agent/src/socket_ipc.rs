@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<DriverFeature>(), 32);
         assert_eq!(std::mem::size_of::<CaptureConfig>(), 48);
         assert_eq!(std::mem::size_of::<CaptureStats>(), 40);
-        assert_eq!(std::mem::size_of::<BinderEvent>(), 376);
+        assert_eq!(std::mem::size_of::<BinderEvent>(), 384);
     }
 
     #[test]
