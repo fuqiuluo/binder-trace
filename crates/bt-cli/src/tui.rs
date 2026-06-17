@@ -633,28 +633,65 @@ impl TransactionColumns {
 
 fn render_frequency(state: &TuiState, width: usize, height: usize) -> Vec<String> {
     render_panel("Frequency", width, height, |inner_width, inner_height| {
+        let columns = FrequencyColumns::new(inner_width);
         let mut lines = Vec::with_capacity(inner_height);
-        lines.push(dim_line(
-            "Process/Direction            Frequency Filter",
-            inner_width,
-        ));
+        lines.push(theme::paint(theme::MUTED, columns.header()));
 
         for entry in frequency_entries(state)
             .into_iter()
             .take(inner_height.saturating_sub(1))
         {
-            let label_width = inner_width.saturating_sub(16).max(8);
-            let line = format!(
-                "{:<label_width$} {:>8}   [+]",
-                entry.label,
-                entry.count,
-                label_width = label_width
-            );
-            lines.push(theme::paint(theme::FREQUENCY, fit(&line, inner_width)));
+            lines.push(theme::paint(
+                theme::FREQUENCY,
+                columns.row(&entry.label, &entry.count.to_string(), "[+]"),
+            ));
         }
 
         lines
     })
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FrequencyColumns {
+    width: usize,
+    label: usize,
+    count: usize,
+    filter: usize,
+}
+
+impl FrequencyColumns {
+    fn new(width: usize) -> Self {
+        const GAP_WIDTH: usize = 2;
+        const COUNT_WIDTH: usize = 9;
+        const FILTER_WIDTH: usize = 6;
+
+        let available = width.saturating_sub(GAP_WIDTH);
+        let filter = FILTER_WIDTH.min(available);
+        let remaining = available.saturating_sub(filter);
+        let count = COUNT_WIDTH.min(remaining);
+        let label = remaining.saturating_sub(count);
+
+        Self {
+            width,
+            label,
+            count,
+            filter,
+        }
+    }
+
+    fn header(self) -> String {
+        self.row("Interface/Code", "Frequency", "Filter")
+    }
+
+    fn row(self, label: &str, count: &str, filter: &str) -> String {
+        let line = format!(
+            "{} {} {}",
+            fit(label, self.label),
+            fit_right(count, self.count),
+            fit_right(filter, self.filter),
+        );
+        fit(&line, self.width)
+    }
 }
 
 fn render_hexdump(state: &TuiState, width: usize, height: usize) -> Vec<String> {
@@ -928,16 +965,47 @@ struct FrequencyEntry {
     count: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct FrequencyKey {
+    interface: String,
+    code: u32,
+}
+
+impl FrequencyKey {
+    fn from_event(
+        event: &BinderEvent,
+        platform_methods: Option<AndroidPlatformMethods>,
+    ) -> Option<Self> {
+        let summary = TransactionSummary::new(event, platform_methods);
+        if summary.interface.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            interface: summary.interface,
+            code: event.code,
+        })
+    }
+
+    fn label(self) -> String {
+        format!("{}#{}", self.interface, self.code)
+    }
+}
+
 fn frequency_entries(state: &TuiState) -> Vec<FrequencyEntry> {
-    let mut counts = BTreeMap::<String, u64>::new();
+    let mut counts = BTreeMap::<FrequencyKey, u64>::new();
     for event in &state.events {
-        let label = format!("uid={} tgid={} {}", event.uid, event.tgid, direction(event));
-        *counts.entry(label).or_default() += 1;
+        if let Some(key) = FrequencyKey::from_event(event, state.platform_methods) {
+            *counts.entry(key).or_default() += 1;
+        }
     }
 
     let mut entries = counts
         .into_iter()
-        .map(|(label, count)| FrequencyEntry { label, count })
+        .map(|(key, count)| FrequencyEntry {
+            label: key.label(),
+            count,
+        })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
         right
@@ -950,7 +1018,10 @@ fn frequency_entries(state: &TuiState) -> Vec<FrequencyEntry> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransactionColumns, truncate_with_ellipsis};
+    use bt_agent::BinderEvent;
+    use bt_decoder::AndroidPlatformMethods;
+
+    use super::{FrequencyColumns, FrequencyKey, TransactionColumns, truncate_with_ellipsis};
 
     #[test]
     fn truncation_marks_omitted_text() {
@@ -1004,5 +1075,93 @@ mod tests {
         );
 
         assert!(row.contains("4294967295"));
+    }
+
+    #[test]
+    fn frequency_key_uses_interface_and_code() {
+        let event = binder_event("android.net.INetworkStatsService", 13, false);
+        let key = FrequencyKey::from_event(&event, Some(AndroidPlatformMethods::new(34)));
+
+        assert_eq!(
+            key.map(FrequencyKey::label).as_deref(),
+            Some("android.net.INetworkStatsService#13")
+        );
+    }
+
+    #[test]
+    fn frequency_key_ignores_replies_without_interface() {
+        let event = binder_event("android.net.INetworkStatsService", 13, true);
+
+        assert_eq!(
+            FrequencyKey::from_event(&event, Some(AndroidPlatformMethods::new(34))),
+            None
+        );
+    }
+
+    #[test]
+    fn frequency_columns_keep_count_and_filter_aligned() {
+        let columns = FrequencyColumns::new(52);
+        let row = columns.row(
+            "android.content.pm.IPackageInstallerSessionFileSystemConnector#4294967295",
+            "12345",
+            "[+]",
+        );
+
+        assert_eq!(row.chars().count(), 52);
+        assert!(row.contains("..."));
+        assert!(row.ends_with(" 12345    [+]"));
+    }
+
+    fn binder_event(interface: &str, code: u32, reply: bool) -> BinderEvent {
+        let payload = parcel_payload(interface);
+        let mut inline_payload = [0_u8; 256];
+        inline_payload[..payload.len()].copy_from_slice(&payload);
+
+        BinderEvent {
+            sequence: 1,
+            timestamp_ns: 0,
+            kind: 1,
+            pid: 0,
+            tgid: 0,
+            uid: 0,
+            reply: u32::from(reply),
+            lost_before: 0,
+            transaction: 0,
+            proc: 0,
+            thread: 0,
+            extra_buffers_size: 0,
+            code,
+            flags: 0,
+            data_size: payload.len() as u64,
+            offsets_size: 0,
+            target_handle: 0,
+            sender_pid: 0,
+            sender_euid: 0,
+            payload_len: payload.len() as u32,
+            payload_truncated: 0,
+            reserved: [0; 7],
+            payload: inline_payload,
+        }
+    }
+
+    fn parcel_payload(interface: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_i32.to_le_bytes());
+        payload.extend_from_slice(&(-1_i32).to_le_bytes());
+        payload.extend_from_slice(b"SYST");
+        write_string16(&mut payload, interface);
+        payload
+    }
+
+    fn write_string16(output: &mut Vec<u8>, value: &str) {
+        let units = value.encode_utf16().collect::<Vec<_>>();
+        output.extend_from_slice(&(units.len() as i32).to_le_bytes());
+        for unit in units {
+            output.extend_from_slice(&unit.to_le_bytes());
+        }
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        while !output.len().is_multiple_of(4) {
+            output.push(0);
+        }
     }
 }
