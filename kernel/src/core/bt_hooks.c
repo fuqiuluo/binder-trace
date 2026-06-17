@@ -2,8 +2,8 @@
 #include <linux/errno.h>
 #include <linux/atomic.h>
 #include <linux/compiler.h>
-#include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/rcupdate.h>
@@ -11,6 +11,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 #include <uapi/linux/android/binder.h>
 
 #include "bt_capture.h"
@@ -71,6 +72,7 @@ struct bt_binder_hook_state {
 
 static struct bt_binder_hook_state bt_binder_hooks;
 static atomic_t bt_active_hook_calls = ATOMIC_INIT(0);
+static DECLARE_WAIT_QUEUE_HEAD(bt_hook_idle_wq);
 static bool bt_hooks_draining;
 
 static void bt_hook_enter(void)
@@ -80,20 +82,24 @@ static void bt_hook_enter(void)
 
 static void bt_hook_leave(void)
 {
-    atomic_dec(&bt_active_hook_calls);
+    if (atomic_dec_and_test(&bt_active_hook_calls)) {
+        wake_up_all(&bt_hook_idle_wq);
+    }
 }
 
 static void bt_wait_for_active_hooks(void)
 {
-    int loops = 0;
+    int active;
 
-    while (atomic_read(&bt_active_hook_calls) > 0) {
-        if ((loops++ % 50) == 0) {
-            bt_info("等待活跃 hook 调用退出: active=%d\n",
-                    atomic_read(&bt_active_hook_calls));
-        }
-        msleep(20);
+    while ((active = atomic_read(&bt_active_hook_calls)) > 0) {
+        bt_info("等待活跃 hook 调用退出: active=%d\n", active);
+        wait_event_timeout(
+            bt_hook_idle_wq,
+            atomic_read(&bt_active_hook_calls) == 0,
+            msecs_to_jiffies(1000));
     }
+
+    bt_info("活跃 hook 调用已经退出\n");
 }
 
 static struct binder_transaction *bt_read_transaction_stack(const struct binder_thread *thread)
@@ -411,6 +417,9 @@ int bt_binder_hooks_install(void)
 {
     int ret;
 
+    WRITE_ONCE(bt_hooks_draining, false);
+    atomic_set(&bt_active_hook_calls, 0);
+
     ret = bt_install_required_hook(
         "binder_ioctl",
         bt_binder_symbols.binder_ioctl,
@@ -475,6 +484,7 @@ static void bt_free_disabled_hook(
 void bt_binder_hooks_remove(void)
 {
     WRITE_ONCE(bt_hooks_draining, true);
+    bt_info("开始移除 Binder hook，停止新采集并等待已进入的调用返回\n");
 
     bt_disable_hook(
         "binder_transaction",

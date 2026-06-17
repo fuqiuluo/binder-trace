@@ -68,5 +68,17 @@ make -C kernel
 kernel/scripts/insmod_ko.sh
 ```
 
-当前阶段不支持普通 `rmmod` 热卸载。模块会自持有引用，避免 Binder 长阻塞
-调用在卸载后返回到已经释放的模块文本段；需要替换模块时请重启测试设备。
+默认 inline hook 的 backup trampoline 使用 `BR X17` 跳回原函数，并临时清理
+相关 hooked text 页的 `PTE_GP`，避免 BTI 拒绝跳入函数内部地址。需要保留
+BTI guarded 页属性时，可以加载模块时设置 `preserve_bti=1`；此时回跳改用
+`RET X17` 保守策略。
+
+```bash
+kernel/scripts/insmod_ko.sh preserve_bti=1
+```
+
+支持使用 `rmmod bt_kmod` 卸载。卸载时模块会先设置 draining 标记，停止新
+采集，恢复 Binder hook 入口，然后阻塞等待已经进入 hook 的调用退出，最后
+释放 trampoline 和控制面资源。因为模块会 hook `binder_ioctl()`，而
+`binder_ioctl()` 可能在 Binder read/looper 路径里长时间阻塞，所以 `rmmod`
+可能等待较久；这是为了避免卸载后返回到已经释放的模块代码。

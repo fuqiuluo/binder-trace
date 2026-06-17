@@ -10,11 +10,19 @@
 #include "hijack_arm64.h"
 #include "inline_hook.h"
 
+bool bt_preserve_bti = false;
+module_param_named(preserve_bti, bt_preserve_bti, bool, 0444);
+MODULE_PARM_DESC(
+    preserve_bti,
+    "保留 hooked text 页的 BTI guard 属性，并使用 RET X17 跳回原函数");
+
 static int __init bt_kmod_init(void)
 {
     int ret;
 
     bt_info("init\n");
+    bt_info("inline hook 跳回策略: %s\n",
+            bt_preserve_bti ? "保留 BTI，使用 RET X17" : "清理 PTE_GP，使用 BR X17");
 
     ret = bt_capture_init();
     if (ret) {
@@ -62,31 +70,17 @@ static int __init bt_kmod_init(void)
         return ret;
     }
 
-    /*
-     * 当前 hook 函数用普通 C 调用 backup，binder_ioctl 可能长时间阻塞并保留
-     * 返回到本模块文本段的栈帧。直到 hook 改为真正 tail-call 形式前，热卸载
-     * 无法做到可靠安全；这里自持有模块引用，让普通 rmmod 返回 busy。
-     */
-    if (!try_module_get(THIS_MODULE)) {
-        bt_err("自持有模块引用失败\n");
-        bt_binder_hooks_remove();
-        bt_protocol_cleanup();
-        wuwa_inlinehook_cleanup();
-        bt_capture_cleanup();
-        return -ENODEV;
-    }
-    bt_info("已禁止普通 rmmod 热卸载，避免 Binder 长阻塞路径返回到已卸载模块\n");
-
     return 0;
 }
 
 static void __exit bt_kmod_exit(void)
 {
-    bt_info("exit\n");
-    bt_capture_cleanup();
+    bt_info("exit: 正在恢复 hook 并等待活跃调用退出\n");
     bt_binder_hooks_remove();
     bt_protocol_cleanup();
+    bt_capture_cleanup();
     wuwa_inlinehook_cleanup();
+    bt_info("exit: 完成\n");
 }
 
 module_init(bt_kmod_init);

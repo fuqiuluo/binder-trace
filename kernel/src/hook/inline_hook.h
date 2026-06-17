@@ -59,6 +59,14 @@
 #define RELOCATE_INST_NUM (TRAMPOLINE_NUM * 8)
 
 /**
+ * @brief 单个 hook 可能清理 BTI guarded 属性的页数量上限。
+ *
+ * 入口页、重定位分支目标页、最终跳回页都可能不同。这里用重定位指令容量
+ * 做宽裕上限，避免复杂入口序列因为记录槽不够而安装失败。
+ */
+#define BTI_GUARD_PAGE_NUM (RELOCATE_INST_NUM + 1)
+
+/**
  * @brief hook 地址信息。
  *
  * 记录一个 hook 点相关的目标地址、替换地址、解析后地址和 backup 地址。
@@ -91,6 +99,16 @@ struct hook_instruction_cache {
 };
 
 /**
+ * @brief 被临时清理 BTI guarded 属性的页。
+ */
+struct hook_bti_guard_page {
+    bool active;        /**< 是否已经记录该页。 */
+    bool had_gp;        /**< 修改前是否带 PTE_GP。 */
+    uintptr_t page_addr;/**< 页起始虚拟地址。 */
+    void *ptep;         /**< 页表项地址，释放 hook 时用于恢复 PTE_GP。 */
+};
+
+/**
  * @brief inline hook 上下文。
  *
  * 框架内部维护地址和指令数据；调用方不应该直接修改。
@@ -98,6 +116,7 @@ struct hook_instruction_cache {
 struct wuwa_inlinehook {
     struct hook_address_info addr;  /**< 地址信息。 */
     struct hook_instruction_cache insn; /**< 指令缓存。 */
+    struct hook_bti_guard_page bti_guard_pages[BTI_GUARD_PAGE_NUM];
 };
 
 #if defined(INLINE_HOOK)

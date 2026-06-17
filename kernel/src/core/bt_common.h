@@ -3,6 +3,7 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/types.h>
 
 #define BT_LOG_PREFIX "[binder-trace] "
 
@@ -24,5 +25,7 @@
 #define wuwa_err bt_err
 #define wuwa_debug bt_debug
 #define wuwa_trace bt_trace
+
+extern bool bt_preserve_bti;
 
 #endif /* BINDER_TRACE_KMOD_COMMON_H */

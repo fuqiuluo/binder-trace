@@ -5,12 +5,18 @@
 #include "bt_common.h"
 #include "bt_utils.h"
 
+#include <asm/pgtable.h>
+#include <asm/tlbflush.h>
+#include <linux/errno.h>
+#include <linux/mm.h>
 #include <linux/rcupdate.h>
 
 #if defined(INLINE_HOOK)
 
 // ARM64 NOP 指令别名。
 #define ARM64_NOP ARM64_INST_NOP
+#define ARM64_BR_X17 0xd61f0220
+#define ARM64_RET_X17 0xd65f0220
 
 // 需要重定位处理的 ARM64 指令类型。
 typedef enum {
@@ -47,6 +53,117 @@ static uint32_t types[] = {
 };
 
 static int32_t relo_len[] = {6, 8, 6, 4, 4, 6, 6, 6, 8, 8, 8, 8, 6, 6, 6, 6, 2};
+
+static bool is_in_backup_code(struct wuwa_inlinehook* hook, uintptr_t addr) {
+    uintptr_t start = hook->addr.backup_addr;
+    uintptr_t end = start + sizeof(hook->insn.relocated_insns);
+
+    return addr >= start && addr < end;
+}
+
+static uint32_t branch_back_x17_insn(void) {
+    if (bt_preserve_bti) {
+        return ARM64_RET_X17;
+    }
+
+    /*
+     * 保守写法原本是 RET X17:
+     * return ARM64_RET_X17;
+     *
+     * 原因是 backup trampoline 跳回的地址通常是 original+N，也就是函数
+     * 内部普通指令，不是 BTI landing pad。BR X17 会按目标页的 PTE_GP 做
+     * BTI 检查，目标点没有 BTI/PAC landing pad 时会触发异常；RET X17 不
+     * 要求返回目标是 BTI landing pad。默认策略改用 BR X17，因此安装 hook
+     * 时会临时清理相关 text 页的 PTE_GP，卸载时再恢复。
+     */
+    return ARM64_BR_X17;
+}
+
+static int hook_track_bti_guard_page(struct wuwa_inlinehook* hook, uintptr_t addr) {
+    uintptr_t page_addr = addr & PAGE_MASK;
+    pte_t *ptep;
+    pte_t pte;
+    int i;
+
+    if (bt_preserve_bti || is_in_backup_code(hook, addr)) {
+        return 0;
+    }
+
+    for (i = 0; i < BTI_GUARD_PAGE_NUM; i++) {
+        if (hook->bti_guard_pages[i].active &&
+            hook->bti_guard_pages[i].page_addr == page_addr) {
+            return 0;
+        }
+    }
+
+    for (i = 0; i < BTI_GUARD_PAGE_NUM; i++) {
+        if (!hook->bti_guard_pages[i].active) {
+            break;
+        }
+    }
+    if (i == BTI_GUARD_PAGE_NUM) {
+        wuwa_err("BTI guard 页记录槽已满，target=0x%lx\n", addr);
+        return -ENOSPC;
+    }
+
+    ptep = page_from_virt_kernel(page_addr);
+    if (!ptep) {
+        wuwa_err("获取 hooked text 页 PTE 失败，target=0x%lx page=0x%lx\n",
+                 addr, page_addr);
+        return -EACCES;
+    }
+
+    pte = READ_ONCE(*ptep);
+    hook->bti_guard_pages[i].active = true;
+    hook->bti_guard_pages[i].page_addr = page_addr;
+    hook->bti_guard_pages[i].ptep = ptep;
+    hook->bti_guard_pages[i].had_gp = !!(pte_val(pte) & PTE_GP);
+
+    if (!hook->bti_guard_pages[i].had_gp) {
+        return 0;
+    }
+
+    pte = clear_pte_bit(pte, __pgprot(PTE_GP));
+    set_pte_at_ex(ptep, pte);
+    __flush_tlb_kernel_pgtable((void*)page_addr);
+    dsb(ish);
+    isb();
+
+    wuwa_info("已清理 hooked text 页 PTE_GP: page=0x%lx target=0x%lx\n",
+              page_addr, addr);
+    return 0;
+}
+
+static void hook_restore_bti_guard_pages(struct wuwa_inlinehook* hook) {
+    int i;
+
+    for (i = 0; i < BTI_GUARD_PAGE_NUM; i++) {
+        struct hook_bti_guard_page *guard = &hook->bti_guard_pages[i];
+        pte_t *ptep;
+        pte_t pte;
+
+        if (!guard->active) {
+            continue;
+        }
+
+        ptep = (pte_t*)guard->ptep;
+        if (ptep && guard->had_gp) {
+            pte = READ_ONCE(*ptep);
+            pte = set_pte_bit(pte, __pgprot(PTE_GP));
+            set_pte_at_ex(ptep, pte);
+            __flush_tlb_kernel_pgtable((void*)guard->page_addr);
+            dsb(ish);
+            isb();
+            wuwa_info("已恢复 hooked text 页 PTE_GP: page=0x%lx\n",
+                      guard->page_addr);
+        }
+
+        guard->active = false;
+        guard->ptep = NULL;
+        guard->page_addr = 0;
+        guard->had_gp = false;
+    }
+}
 
 // 判断地址是否落在目标函数入口 trampoline 范围内。
 static int is_in_tramp(struct wuwa_inlinehook* hook, uint64_t addr) {
@@ -94,15 +211,20 @@ static int branch_func_addr_once(uintptr_t addr, uintptr_t* out_final_addr) {
 
 int branch_absolute_addr(uint32_t* buf, uintptr_t target) {
     buf[0] = 0x58000051; // LDR X17, #8，加载绝对跳转目标。
-    buf[1] = 0xd61f0220; // BR X17，跳转到目标地址。
+    buf[1] = ARM64_BR_X17; // BR X17，跳转到目标地址。
     buf[2] = target & 0xFFFFFFFF;
     buf[3] = target >> 32u;
     return 4;
 }
 
-static int branch_absolute_addr_as_return(uint32_t* buf, uintptr_t target) {
+static int branch_absolute_addr_as_return(struct wuwa_inlinehook* hook, uint32_t* buf, uintptr_t target) {
+    int ret = hook_track_bti_guard_page(hook, target);
+    if (ret) {
+        return ret;
+    }
+
     buf[0] = 0x58000051; // LDR X17, #8，加载续执行地址。
-    buf[1] = 0xd65f0220; // RET X17，避免 BTI 拒绝跳入函数内部地址。
+    buf[1] = branch_back_x17_insn(); // 默认 BR X17；preserve_bti=1 时使用 RET X17 保守策略。
     buf[2] = target & 0xFFFFFFFF;
     buf[3] = target >> 32u;
     return 4;
@@ -113,6 +235,7 @@ int relo_b(struct wuwa_inlinehook* hook, uint64_t inst_addr, uint32_t inst, inst
     uint32_t* buf = hook->insn.relocated_insns + hook->insn.relocated_count;
     uint64_t imm64, addr;
     uint32_t idx = 0;
+    int ret;
 
     if (type == INST_BC) {
         uint64_t imm19 = BITS32(inst, 23, 5);
@@ -135,7 +258,11 @@ int relo_b(struct wuwa_inlinehook* hook, uint64_t inst_addr, uint32_t inst, inst
     if (type == INST_BL) {
         buf[idx++] = 0xD63F0220; // BLR X17，保留带链接调用。
     } else {
-        buf[idx++] = 0xD65F0220; // RET X17，跳入函数内部地址时避开 BTI landing pad 约束。
+        ret = hook_track_bti_guard_page(hook, addr);
+        if (ret) {
+            return ret;
+        }
+        buf[idx++] = branch_back_x17_insn(); // 默认 BR X17；preserve_bti=1 时使用 RET X17 保守策略。
     }
     buf[idx++] = ARM64_NOP;
     return 0;
@@ -214,16 +341,21 @@ int relo_ldr(struct wuwa_inlinehook* hook, uint64_t inst_addr, uint32_t inst, in
 
 int relo_cb(struct wuwa_inlinehook* hook, uint64_t inst_addr, uint32_t inst, inst_type_t type) {
     uint32_t* buf = hook->insn.relocated_insns + hook->insn.relocated_count;
+    int ret;
 
     uint64_t imm19 = BITS32(inst, 23, 5);
     uint64_t offset = SIGN64_EXTEND((imm19 << 2u), 21u);
     uint64_t addr = inst_addr + offset;
     addr = relo_in_tramp(hook, addr);
+    ret = hook_track_bti_guard_page(hook, addr);
+    if (ret) {
+        return ret;
+    }
 
     buf[0] = (inst & 0xFF00001F) | 0x40u; // CB(N)Z Rt, #8，保留比较分支。
     buf[1] = 0x14000005; // B #20，跳过绝对跳转序列。
     buf[2] = 0x58000051; // LDR X17, #8，加载分支目标。
-    buf[3] = 0xd65f0220; // RET X17，跳入函数内部地址时避开 BTI landing pad 约束。
+    buf[3] = branch_back_x17_insn(); // 默认 BR X17；preserve_bti=1 时使用 RET X17 保守策略。
     buf[4] = addr & 0xFFFFFFFF;
     buf[5] = addr >> 32u;
     return 0;
@@ -231,16 +363,21 @@ int relo_cb(struct wuwa_inlinehook* hook, uint64_t inst_addr, uint32_t inst, ins
 
 int relo_tb(struct wuwa_inlinehook* hook, uint64_t inst_addr, uint32_t inst, inst_type_t type) {
     uint32_t* buf = hook->insn.relocated_insns + hook->insn.relocated_count;
+    int ret;
 
     uint64_t imm14 = BITS32(inst, 18, 5);
     uint64_t offset = SIGN64_EXTEND((imm14 << 2u), 16u);
     uint64_t addr = inst_addr + offset;
     addr = relo_in_tramp(hook, addr);
+    ret = hook_track_bti_guard_page(hook, addr);
+    if (ret) {
+        return ret;
+    }
 
     buf[0] = (inst & 0xFFF8001F) | 0x40u; // TB(N)Z Rt, #<imm>, #8，保留位测试分支。
     buf[1] = 0x14000005; // B #20，跳过绝对跳转序列。
     buf[2] = 0x58000051; // LDR X17, #8，加载分支目标。
-    buf[3] = 0xd65f0220; // RET X17，跳入函数内部地址时避开 BTI landing pad 约束。
+    buf[3] = branch_back_x17_insn(); // 默认 BR X17；preserve_bti=1 时使用 RET X17 保守策略。
     buf[4] = addr & 0xFFFFFFFF;
     buf[5] = addr >> 32u;
     return 0;
@@ -339,6 +476,15 @@ __nocfi struct wuwa_inlinehook* wuwa_install_hook(void* target, void* replace, v
     hook->addr.backup_addr = (uintptr_t)(hook->insn.relocated_insns);
     *backup = (void*)(hook->addr.backup_addr);
 
+    /*
+     * 默认 trampoline 第一条是 LDR，不再是原函数入口的 BTI/PAC landing pad。
+     * 清掉入口页 PTE_GP 后，间接调用落到 hooked 函数入口也不会触发 BTI。
+     */
+    ret = hook_track_bti_guard_page(hook, hook->addr.resolved_addr);
+    if (ret) {
+        goto err_free_hook;
+    }
+
     // 保存原始入口指令，卸载 hook 时用于恢复。
     for (i = 0; i < TRAMPOLINE_NUM; i++) {
         hook->insn.saved_insns[i] = *((uint32_t*)hook->addr.resolved_addr + i);
@@ -357,6 +503,10 @@ __nocfi struct wuwa_inlinehook* wuwa_install_hook(void* target, void* replace, v
         uint64_t inst_addr = hook->addr.resolved_addr + i * INSTRUCTION_SIZE;
         uint32_t inst = hook->insn.saved_insns[i];
         int relo_res = relocate_inst(hook, inst_addr, inst);
+        if (relo_res == -EACCES || relo_res == -ENOSPC) {
+            ret = relo_res;
+            goto err_free_hook;
+        }
         if (relo_res < 0) {
             // 单条重定位失败时先继续，后续需要按具体目标函数做兼容性验证。
         }
@@ -365,7 +515,11 @@ __nocfi struct wuwa_inlinehook* wuwa_install_hook(void* target, void* replace, v
     // 在重定位代码末尾追加跳回原函数剩余部分的分支。
     back_dst_addr = hook->addr.resolved_addr + hook->insn.trampoline_count * INSTRUCTION_SIZE;
     buf = hook->insn.relocated_insns + hook->insn.relocated_count;
-    hook->insn.relocated_count += branch_absolute_addr_as_return(buf, back_dst_addr);
+    ret = branch_absolute_addr_as_return(hook, buf, back_dst_addr);
+    if (ret < 0) {
+        goto err_free_hook;
+    }
+    hook->insn.relocated_count += ret;
 
     // 刷新重定位代码的指令缓存。
     flush_icache_range_ex(hook->addr.backup_addr,
@@ -379,11 +533,15 @@ __nocfi struct wuwa_inlinehook* wuwa_install_hook(void* target, void* replace, v
                            hook->insn.trampoline_count * INSTRUCTION_SIZE);
     if (ret) {
         wuwa_err("安装 trampoline 失败: %d\n", ret);
-        free_kernel_exec_memory(hook, sizeof(struct wuwa_inlinehook));
-        return ERR_PTR(ret);
+        goto err_free_hook;
     }
 
     return hook;
+
+err_free_hook:
+    hook_restore_bti_guard_pages(hook);
+    free_kernel_exec_memory(hook, sizeof(struct wuwa_inlinehook));
+    return ERR_PTR(ret);
 }
 
 __nocfi int wuwa_disable_hook(struct wuwa_inlinehook* hook) {
@@ -419,6 +577,7 @@ __nocfi void wuwa_free_hook(struct wuwa_inlinehook* hook) {
         return;
     }
 
+    hook_restore_bti_guard_pages(hook);
     free_kernel_exec_memory(hook, sizeof(struct wuwa_inlinehook));
 }
 
