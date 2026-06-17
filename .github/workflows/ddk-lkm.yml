@@ -52,8 +52,6 @@ jobs:
           echo "Copied to: /github/workspace/out/$OUTPUT_NAME"
           ls -la "/github/workspace/out/$OUTPUT_NAME"
           echo "Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
-          llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
-          echo "Stripped size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
 
       - name: Upload ${{ inputs.module_name }}.ko artifact
         uses: actions/upload-artifact@v4
