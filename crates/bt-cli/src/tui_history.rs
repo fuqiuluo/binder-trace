@@ -9,6 +9,8 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::mem::size_of;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use bt_agent::{BinderEvent, SocketIpcClient, SocketIpcError};
@@ -85,6 +87,7 @@ pub struct CaptureHistory {
     file: File,
     mmap: MmapMut,
     path: PathBuf,
+    _path_lock: Option<CapturePathLock>,
     count: u64,
     capacity: u64,
 }
@@ -98,6 +101,7 @@ impl CaptureHistory {
     }
 
     fn create_with_capacity(path: PathBuf, capacity: u64) -> Result<Self, HistoryError> {
+        let path_lock = CapturePathLock::prepare(&path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -110,10 +114,14 @@ impl CaptureHistory {
             mmap: map_file(&file)?,
             file,
             path,
+            _path_lock: path_lock,
             count: 0,
             capacity,
         };
         *history.header_mut()? = CaptureFileHeader::new(capacity);
+        if let Some(path_lock) = history._path_lock.as_mut() {
+            path_lock.lock()?;
+        }
         Ok(history)
     }
 
@@ -292,9 +300,83 @@ fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[cfg(unix)]
+struct CapturePathLock {
+    parent: PathBuf,
+    restore_mode: u32,
+    locked: bool,
+}
+
+#[cfg(unix)]
+impl CapturePathLock {
+    fn prepare(path: &Path) -> io::Result<Option<Self>> {
+        const MODE_MASK: u32 = 0o7777;
+
+        if !should_lock_default_capture_path(path) {
+            return Ok(None);
+        }
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "历史文件缺少父目录"))?;
+        let mode = fs::metadata(parent)?.permissions().mode() & MODE_MASK;
+        let restore_mode = mode | 0o700;
+        if restore_mode != mode {
+            fs::set_permissions(parent, fs::Permissions::from_mode(restore_mode))?;
+        }
+
+        Ok(Some(Self {
+            parent: parent.to_path_buf(),
+            restore_mode,
+            locked: false,
+        }))
+    }
+
+    fn lock(&mut self) -> io::Result<()> {
+        // unlink 权限来自父目录；普通文件锁挡不住 `rm events.btcap`。
+        fs::set_permissions(
+            &self.parent,
+            fs::Permissions::from_mode(self.restore_mode & !0o222),
+        )?;
+        self.locked = true;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CapturePathLock {
+    fn drop(&mut self) {
+        if self.locked {
+            let _ =
+                fs::set_permissions(&self.parent, fs::Permissions::from_mode(self.restore_mode));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn should_lock_default_capture_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "events.btcap")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "binder-trace")
+}
+
+#[cfg(not(unix))]
+struct CapturePathLock;
+
+#[cfg(not(unix))]
+impl CapturePathLock {
+    fn prepare(_path: &Path) -> io::Result<Option<Self>> {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use bt_agent::BinderEvent;
@@ -372,6 +454,37 @@ mod tests {
         assert!(metadata.len() >= (HEADER_SIZE + EVENT_SIZE) as u64);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locks_default_events_parent_until_history_is_dropped() {
+        let root = temp_path("protected-root");
+        let path = root.join("binder-trace/events.btcap");
+        let mut history = CaptureHistory::create(path.clone(), 1).expect("历史文件应可创建");
+
+        history
+            .append_for_test(test_event(1))
+            .expect("受保护历史文件仍应可追加");
+
+        let parent = path.parent().expect("历史文件应有父目录").to_path_buf();
+        let locked_mode = fs::metadata(&parent)
+            .expect("父目录元数据应可读取")
+            .permissions()
+            .mode();
+        assert_eq!(locked_mode & 0o222, 0);
+
+        drop(history);
+
+        let restored_mode = fs::metadata(&parent)
+            .expect("父目录元数据应可读取")
+            .permissions()
+            .mode();
+        assert_ne!(restored_mode & 0o200, 0);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir(parent);
+        let _ = fs::remove_dir(root);
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
