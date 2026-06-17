@@ -4,11 +4,9 @@ Binder trace 工具工作区，用于研究和实现 Android Binder 调用观测
 
 ## 效果图
 
-| TUI |
-| --- |
+| TUI                                                                                |
+|------------------------------------------------------------------------------------|
 | [![binder-trace TUI 演示](docs/assets/tui-demo-thumb.png)](docs/assets/tui-demo.png) |
-
-截图资源放在 `docs/assets/`；README 使用缩略图链接到原图，后续 Web UI 截图按同样方式追加。
 
 ## 目录结构
 
