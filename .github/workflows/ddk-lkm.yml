@@ -1,31 +1,31 @@
-name: DDK 构建内核模块
+name: DDK kernel module build
 
 on:
   workflow_call:
     inputs:
       kmi:
-        description: "KMI 版本"
+        description: "KMI version"
         required: true
         type: string
       ddk_release:
-        description: "DDK 发布版本"
+        description: "DDK release version"
         required: false
         default: "20251016"
         type: string
       module_name:
-        description: "不带 .ko 后缀的内核模块名"
+        description: "Kernel module name without the .ko suffix"
         required: false
         default: "bt-kmod"
         type: string
       module_dir:
-        description: "包含模块 Makefile 的目录"
+        description: "Directory that contains the module Makefile"
         required: false
         default: "kernel"
         type: string
 
 jobs:
   build-module:
-    name: 为 ${{ inputs.kmi }} 构建 ${{ inputs.module_name }}.ko
+    name: Build ${{ inputs.module_name }}.ko for ${{ inputs.kmi }}
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
@@ -35,27 +35,27 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: 构建 ${{ inputs.module_name }}.ko
+      - name: Build ${{ inputs.module_name }}.ko
         working-directory: ${{ inputs.module_dir }}
         run: |
-          echo "=== 为 KMI ${{ inputs.kmi }} 构建 ${{ inputs.module_name }}.ko ==="
+          echo "=== Build ${{ inputs.module_name }}.ko for KMI ${{ inputs.kmi }} ==="
 
           make KDIR=$KERNEL_SRC
 
-          echo "=== 构建完成 ==="
+          echo "=== Build finished ==="
 
           mkdir -p /github/workspace/out
 
           OUTPUT_NAME="${{ inputs.module_name }}-${{ inputs.kmi }}.ko"
           cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$OUTPUT_NAME"
 
-          echo "已复制到: /github/workspace/out/$OUTPUT_NAME"
+          echo "Copied to: /github/workspace/out/$OUTPUT_NAME"
           ls -la "/github/workspace/out/$OUTPUT_NAME"
-          echo "大小: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
+          echo "Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
           llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
-          echo "去符号后大小: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
+          echo "Stripped size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
 
-      - name: 上传 ${{ inputs.module_name }}.ko 产物
+      - name: Upload ${{ inputs.module_name }}.ko artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.module_name }}-${{ inputs.kmi }}.ko

@@ -1,4 +1,4 @@
-name: 构建 binder-trace 内核模块
+name: Build binder-trace kernel module
 
 on:
   push:
@@ -16,7 +16,7 @@ on:
 
 jobs:
   build-modules:
-    name: 为 ${{ matrix.kmi }} 构建 bt-kmod.ko
+    name: Build bt-kmod.ko for ${{ matrix.kmi }}
     uses: ./.github/workflows/ddk-lkm.yml
     strategy:
       fail-fast: false
