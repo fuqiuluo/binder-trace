@@ -74,19 +74,12 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
                     (entry.history_index, event, summary)
                 })
                 .collect::<Vec<_>>();
-            let has_method = rows
-                .iter()
-                .any(|(_, _, summary)| !summary.method.is_empty());
             let sequence_width = rows
                 .iter()
                 .map(|(_, event, _)| display_width(&event.sequence.to_string()))
                 .max()
                 .unwrap_or_else(|| display_width("Seq"));
-            let columns = TransactionColumns::new_with_sequence_width(
-                inner_width,
-                has_method,
-                sequence_width,
-            );
+            let columns = TransactionColumns::new_with_sequence_width(inner_width, sequence_width);
             lines.push(theme::paint(theme::MUTED, columns.header()));
 
             for (history_index, event, summary) in rows {
@@ -95,8 +88,8 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
                     direction(event),
                     summary.interface.as_str(),
                     &summary.code.to_string(),
-                    summary.method,
                     &format!("0x{:x}", event.data_size),
+                    summary.method,
                 );
                 let color = transaction_color_index(&summary, event);
                 if history_index == state.selected {
@@ -123,21 +116,16 @@ pub(super) struct TransactionColumns {
 }
 
 impl TransactionColumns {
-    pub(super) fn new_with_sequence_width(
-        width: usize,
-        has_method: bool,
-        sequence_width: usize,
-    ) -> Self {
+    pub(super) fn new_with_sequence_width(width: usize, sequence_width: usize) -> Self {
         const DIRECTION_WIDTH: usize = 5;
         const CODE_WIDTH: usize = 10;
         const LEN_WIDTH: usize = 8;
         const MIN_INTERFACE_WIDTH: usize = 18;
         const MAX_INTERFACE_WIDTH: usize = 56;
-        const MIN_METHOD_WIDTH: usize = 12;
+        const MIN_METHOD_WIDTH: usize = 6;
         const MAX_METHOD_WIDTH: usize = 28;
 
-        let gap_width = if has_method { 5 } else { 4 };
-        let available = width.saturating_sub(gap_width);
+        let available = width.saturating_sub(5);
         let sequence = sequence_width.max(display_width("Seq")).min(available);
         let remaining = available.saturating_sub(sequence);
         let direction = DIRECTION_WIDTH.min(remaining);
@@ -146,17 +134,34 @@ impl TransactionColumns {
         let remaining = remaining.saturating_sub(code);
         let len = LEN_WIDTH.min(remaining);
         let remaining = remaining.saturating_sub(len);
-        let method = if has_method && remaining > MIN_INTERFACE_WIDTH {
-            let available_for_method = remaining.saturating_sub(MIN_INTERFACE_WIDTH);
-            if available_for_method >= MIN_METHOD_WIDTH {
-                MAX_METHOD_WIDTH.min(available_for_method)
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        let interface = remaining.saturating_sub(method).min(MAX_INTERFACE_WIDTH);
+        let can_show_method = remaining >= MIN_INTERFACE_WIDTH + MIN_METHOD_WIDTH;
+
+        if !can_show_method {
+            let available = width.saturating_sub(4);
+            let sequence = sequence_width.max(display_width("Seq")).min(available);
+            let remaining = available.saturating_sub(sequence);
+            let direction = DIRECTION_WIDTH.min(remaining);
+            let remaining = remaining.saturating_sub(direction);
+            let code = CODE_WIDTH.min(remaining);
+            let remaining = remaining.saturating_sub(code);
+            let len = LEN_WIDTH.min(remaining);
+            let remaining = remaining.saturating_sub(len);
+
+            return Self {
+                width,
+                sequence,
+                direction,
+                interface: remaining.min(MAX_INTERFACE_WIDTH),
+                code,
+                method: 0,
+                len,
+            };
+        }
+
+        let interface = remaining
+            .saturating_sub(MIN_METHOD_WIDTH)
+            .min(MAX_INTERFACE_WIDTH);
+        let method = remaining.saturating_sub(interface).min(MAX_METHOD_WIDTH);
 
         Self {
             width,
@@ -170,7 +175,7 @@ impl TransactionColumns {
     }
 
     pub(super) fn header(self) -> String {
-        self.row("Seq", "Dir", "Interface", "#", "Method", "Len")
+        self.row("Seq", "Dir", "Interface", "#", "Len", "Method")
     }
 
     pub(super) fn row(
@@ -179,8 +184,8 @@ impl TransactionColumns {
         direction: &str,
         interface: &str,
         code: &str,
-        method: &str,
         len: &str,
+        method: &str,
     ) -> String {
         let line = if self.method == 0 {
             format!(
@@ -198,8 +203,8 @@ impl TransactionColumns {
                 fit(direction, self.direction),
                 fit(interface, self.interface),
                 fit_right(code, self.code),
-                fit(method, self.method),
                 fit_right(len, self.len),
+                fit(method, self.method),
             )
         };
         fit(&line, self.width)

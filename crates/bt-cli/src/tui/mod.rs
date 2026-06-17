@@ -946,13 +946,13 @@ mod tests {
     #[test]
     fn transaction_columns_keep_row_width() {
         for width in [6, 24, 65, 100] {
-            let row = TransactionColumns::new_with_sequence_width(width, true, 9).row(
+            let row = TransactionColumns::new_with_sequence_width(width, 9).row(
                 "123456789",
                 "send",
                 "android.app.IActivityManager",
                 "1000000",
-                "someExtremelyLongMethodName",
                 "0x123456789",
+                "someExtremelyLongMethodName",
             );
 
             assert_eq!(row.chars().count(), width);
@@ -960,23 +960,25 @@ mod tests {
     }
 
     #[test]
-    fn transaction_columns_drop_method_when_empty() {
-        let header = TransactionColumns::new_with_sequence_width(80, false, 3).header();
+    fn transaction_columns_show_method_by_default_after_len() {
+        let header = TransactionColumns::new_with_sequence_width(80, 3).header();
+        let len = header.find("Len").expect("header should include Len");
+        let method = header.find("Method").expect("header should include Method");
 
-        assert!(!header.contains("Method"));
+        assert!(len < method);
     }
 
     #[test]
     fn transaction_columns_shrink_sequence_padding_to_visible_rows() {
-        let columns = TransactionColumns::new_with_sequence_width(80, false, 3);
+        let columns = TransactionColumns::new_with_sequence_width(80, 3);
         let header = columns.header();
         let row = columns.row(
             "716",
             "send",
             "android.hidl.base@1.0::IBase",
             "256067662",
-            "",
             "0x20",
+            "",
         );
 
         assert!(header.starts_with("Seq Dir"));
@@ -985,7 +987,7 @@ mod tests {
 
     #[test]
     fn transaction_columns_do_not_stretch_interface_on_wide_terminals() {
-        let columns = TransactionColumns::new_with_sequence_width(180, true, 3);
+        let columns = TransactionColumns::new_with_sequence_width(180, 3);
 
         assert_eq!(columns.interface, 56);
         assert_eq!(columns.method, 28);
@@ -993,14 +995,14 @@ mod tests {
 
     #[test]
     fn transaction_columns_keep_full_u32_code_width() {
-        let columns = TransactionColumns::new_with_sequence_width(100, true, 1);
+        let columns = TransactionColumns::new_with_sequence_width(100, 1);
         let row = columns.row(
             "1",
             "reply",
             "android.content.pm.IPackageManager",
             "4294967295",
-            "method",
             "0x10",
+            "method",
         );
 
         assert!(row.contains("4294967295"));
@@ -1009,9 +1011,9 @@ mod tests {
 
     #[test]
     fn transaction_columns_include_direction_header() {
-        let columns = TransactionColumns::new_with_sequence_width(80, true, 3);
+        let columns = TransactionColumns::new_with_sequence_width(80, 3);
         let header = columns.header();
-        let row = columns.row("1", "send", "android.os.IMessenger", "1", "send", "0x20");
+        let row = columns.row("1", "send", "android.os.IMessenger", "1", "0x20", "send");
 
         assert!(header.contains("Dir"));
         assert!(row.contains("send"));
