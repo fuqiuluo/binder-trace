@@ -130,7 +130,6 @@ impl CaptureHistory {
         &self.path
     }
 
-    #[cfg(test)]
     pub const fn event_count(&self) -> u64 {
         self.count
     }

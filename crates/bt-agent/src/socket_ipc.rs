@@ -270,6 +270,11 @@ impl SocketIpcClient {
         self.family
     }
 
+    /// 返回底层控制 socket fd，供外部事件循环等待可读状态。
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+
     pub fn get_feature(&self) -> Result<DriverFeature, SocketIpcError> {
         let mut feature = DriverFeature {
             magic: 0,

@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::future;
 use std::io::{self, Read, Stdout, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -18,6 +19,8 @@ use bt_decoder::{AndroidPlatformMethods, parse_interface_token};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
+use tokio::io::unix::AsyncFd;
+use tokio::time::{self, MissedTickBehavior};
 
 use crate::tui_history::{CaptureHistory, HistoryError};
 
@@ -30,6 +33,7 @@ mod theme {
     pub const TRANSACTION_SEND: Style = ansi256_fg(51);
     pub const TRANSACTION_REPLY: Style = ansi256_fg(226);
     pub const FREQUENCY: Style = ansi256_fg(120);
+    pub const FREQUENCY_CODE: Style = ansi256_fg(226);
     pub const MUTED: Style = Style::new().dimmed();
     pub const TITLE: Style = Style::new().bold();
     pub const SELECTED: Style = Style::new()
@@ -115,6 +119,7 @@ struct TuiState {
     selected: u64,
     total_events: u64,
     frequency_counts: BTreeMap<FrequencyKey, u64>,
+    frequency_counted_events: u64,
     stats: CaptureStats,
     recording: bool,
     help_visible: bool,
@@ -142,6 +147,7 @@ impl TuiState {
             selected: 0,
             total_events: 0,
             frequency_counts: BTreeMap::new(),
+            frequency_counted_events: 0,
             stats,
             recording: true,
             help_visible: false,
@@ -156,9 +162,6 @@ impl TuiState {
     fn push_event(&mut self, history_index: u64, event: BinderEvent) {
         let follows_tail = self.total_events == 0 || self.selected + 1 >= self.total_events;
         self.total_events = history_index + 1;
-        if let Some(key) = FrequencyKey::from_event(&event, self.platform_methods) {
-            *self.frequency_counts.entry(key).or_default() += 1;
-        }
 
         if !follows_tail {
             return;
@@ -180,6 +183,18 @@ impl TuiState {
 
         self.events.push_back(event);
         self.selected = history_index;
+    }
+
+    fn sync_frequency_counts(&mut self, history: &CaptureHistory) -> Result<(), TuiError> {
+        while self.frequency_counted_events < history.event_count() {
+            let event = history.event_at(self.frequency_counted_events)?;
+            if let Some(key) = FrequencyKey::from_event(&event, self.platform_methods) {
+                *self.frequency_counts.entry(key).or_default() += 1;
+            }
+            self.frequency_counted_events += 1;
+        }
+
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -257,90 +272,221 @@ impl Drop for TerminalSession {
 }
 
 pub fn run_tui(client: &SocketIpcClient, family: i32, config: TuiConfig) -> Result<(), TuiError> {
-    let history_path = config
-        .history_path
-        .unwrap_or_else(CaptureHistory::default_path);
-    let mut history = CaptureHistory::create(history_path, config.rows.max(1))?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?
+        .block_on(run_tui_async(client, family, config))
+}
+
+async fn run_tui_async(
+    client: &SocketIpcClient,
+    family: i32,
+    config: TuiConfig,
+) -> Result<(), TuiError> {
+    const MAX_EVENTS_PER_TICK: usize = 512;
+
+    let TuiConfig {
+        rows,
+        refresh,
+        capture_config,
+        android_sdk,
+        history_path,
+    } = config;
+
+    let history_path = history_path.unwrap_or_else(CaptureHistory::default_path);
+    let mut history = CaptureHistory::create(history_path, rows.max(1))?;
     let mut terminal = TerminalSession::enter()?;
-    let capture_guard = CaptureGuard::new(client, config.capture_config);
+    let capture_guard = CaptureGuard::new(client, capture_config);
     let mut state = TuiState::new(
         family,
-        config.rows.max(1),
+        rows.max(1),
         client.get_stats()?,
         terminal.input.is_some(),
-        config.android_sdk,
+        android_sdk,
         history.path().to_path_buf(),
     );
-    let refresh = config
-        .refresh
-        .clamp(Duration::from_millis(50), Duration::from_secs(5));
-    let mut last_stats_at = Instant::now();
-    let mut next_frame_at = Instant::now();
+    let refresh = refresh.clamp(Duration::from_millis(50), Duration::from_secs(5));
+    let socket_ready = AsyncFd::new(RawFdSource::new(client.raw_fd()))?;
+    let mut input_ready = terminal
+        .input
+        .as_ref()
+        .map(|input| AsyncFd::new(RawFdSource::new(input.raw_fd())))
+        .transpose()?;
+    let mut stats_interval = time::interval_at(
+        time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    stats_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut frame_interval = time::interval_at(time::Instant::now() + refresh, refresh);
+    frame_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dirty = true;
 
-    render(&mut terminal.stdout, &state)?;
+    render_if_dirty(&mut terminal.stdout, &state, &mut dirty)?;
 
     loop {
-        if let Some(input) = terminal.input.as_mut() {
-            match input.read_command() {
-                Ok(Some(UiCommand::Quit)) => break,
-                Ok(Some(UiCommand::ToggleRecording)) => {
-                    toggle_recording(client, &mut state, config.capture_config)?;
-                    dirty = true;
+        tokio::select! {
+            input_result = wait_optional_readable(input_ready.as_ref()) => {
+                input_result?;
+                if drain_input_commands(
+                    &mut terminal,
+                    &mut input_ready,
+                    client,
+                    &mut state,
+                    capture_config,
+                    &history,
+                    &mut dirty,
+                )? {
+                    break;
                 }
-                Ok(Some(UiCommand::Clear)) => {
-                    state.clear();
+                render_if_dirty(&mut terminal.stdout, &state, &mut dirty)?;
+            }
+            socket_result = wait_readable(&socket_ready) => {
+                socket_result?;
+                if drain_socket_events(client, &mut history, &mut state, MAX_EVENTS_PER_TICK)? {
                     dirty = true;
-                }
-                Ok(Some(UiCommand::Help)) => {
-                    state.help_visible = !state.help_visible;
-                    dirty = true;
-                }
-                Ok(Some(command)) => {
-                    state.move_selection(command, 10);
-                    state.ensure_selected_loaded(&history)?;
-                    dirty = true;
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    terminal.input = None;
-                    state.input_available = false;
-                    dirty = true;
+                    render_if_dirty(&mut terminal.stdout, &state, &mut dirty)?;
                 }
             }
-        }
-
-        if client.poll_event(Duration::from_millis(20))? {
-            if state.recording {
-                while let Some(index) =
-                    history.recv_next_matching(client, BinderEvent::is_binder_transaction)?
-                {
-                    let event = history.event_at(index)?;
-                    state.push_event(index, event);
-                    dirty = true;
-                }
-            } else {
-                while client.try_recv_event()?.is_some() {
-                    dirty = true;
-                }
+            _ = stats_interval.tick() => {
+                state.stats = client.get_stats()?;
+                history.flush_async()?;
+                dirty = true;
+                render_if_dirty(&mut terminal.stdout, &state, &mut dirty)?;
             }
-        }
-
-        if last_stats_at.elapsed() >= Duration::from_secs(1) {
-            state.stats = client.get_stats()?;
-            history.flush_async()?;
-            last_stats_at = Instant::now();
-            dirty = true;
-        }
-
-        if dirty && Instant::now() >= next_frame_at {
-            render(&mut terminal.stdout, &state)?;
-            next_frame_at = Instant::now() + refresh;
-            dirty = false;
+            _ = frame_interval.tick() => {
+                render_if_dirty(&mut terminal.stdout, &state, &mut dirty)?;
+            }
         }
     }
 
     drop(capture_guard);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawFdSource {
+    fd: RawFd,
+}
+
+impl RawFdSource {
+    const fn new(fd: RawFd) -> Self {
+        Self { fd }
+    }
+}
+
+impl AsRawFd for RawFdSource {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+async fn wait_readable(fd: &AsyncFd<RawFdSource>) -> io::Result<()> {
+    let mut guard = fd.readable().await?;
+    guard.clear_ready();
+    Ok(())
+}
+
+async fn wait_optional_readable(fd: Option<&AsyncFd<RawFdSource>>) -> io::Result<()> {
+    match fd {
+        Some(fd) => wait_readable(fd).await,
+        None => future::pending().await,
+    }
+}
+
+fn drain_input_commands(
+    terminal: &mut TerminalSession,
+    input_ready: &mut Option<AsyncFd<RawFdSource>>,
+    client: &SocketIpcClient,
+    state: &mut TuiState,
+    capture_config: Option<CaptureConfig>,
+    history: &CaptureHistory,
+    dirty: &mut bool,
+) -> Result<bool, TuiError> {
+    let mut input_failed = false;
+
+    if let Some(input) = terminal.input.as_mut() {
+        loop {
+            match input.read_command() {
+                Ok(Some(UiCommand::Quit)) => return Ok(true),
+                Ok(Some(UiCommand::ToggleRecording)) => {
+                    toggle_recording(client, state, capture_config)?;
+                    *dirty = true;
+                }
+                Ok(Some(UiCommand::Clear)) => {
+                    state.clear();
+                    *dirty = true;
+                }
+                Ok(Some(UiCommand::Help)) => {
+                    state.help_visible = !state.help_visible;
+                    *dirty = true;
+                }
+                Ok(Some(command)) => {
+                    state.move_selection(command, 10);
+                    state.ensure_selected_loaded(history)?;
+                    *dirty = true;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    input_failed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if input_failed {
+        terminal.input = None;
+        *input_ready = None;
+        state.input_available = false;
+        *dirty = true;
+    }
+
+    Ok(false)
+}
+
+fn drain_socket_events(
+    client: &SocketIpcClient,
+    history: &mut CaptureHistory,
+    state: &mut TuiState,
+    max_events: usize,
+) -> Result<bool, TuiError> {
+    let mut changed = false;
+
+    if state.recording {
+        let mut appended = false;
+        for _ in 0..max_events {
+            let Some(index) =
+                history.recv_next_matching(client, BinderEvent::is_binder_transaction)?
+            else {
+                break;
+            };
+            let event = history.event_at(index)?;
+            state.push_event(index, event);
+            appended = true;
+            changed = true;
+        }
+        if appended {
+            state.sync_frequency_counts(history)?;
+        }
+    } else {
+        for _ in 0..max_events {
+            if client.try_recv_event()?.is_none() {
+                break;
+            }
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn render_if_dirty(out: &mut Stdout, state: &TuiState, dirty: &mut bool) -> Result<(), TuiError> {
+    if *dirty {
+        render(out, state)?;
+        *dirty = false;
+    }
+
     Ok(())
 }
 
@@ -431,6 +577,10 @@ impl TtyInput {
         }
 
         Ok(None)
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 }
 
@@ -546,10 +696,12 @@ fn poll_fd(fd: RawFd) -> io::Result<bool> {
 }
 
 fn render(out: &mut Stdout, state: &TuiState) -> io::Result<()> {
+    const STATUS_HEIGHT: usize = 2;
+
     let (width, height) = terminal::size().unwrap_or((120, 36));
     let width = usize::from(width).max(72);
     let height = usize::from(height).max(20);
-    let content_height = height.saturating_sub(1);
+    let content_height = height.saturating_sub(STATUS_HEIGHT);
     let top_height = ((content_height * 52) / 100).clamp(8, content_height.saturating_sub(6));
     let bottom_height = content_height.saturating_sub(top_height).max(6);
     let left_width = ((width * 56) / 100).clamp(38, width.saturating_sub(28));
@@ -573,8 +725,10 @@ fn render(out: &mut Stdout, state: &TuiState) -> io::Result<()> {
         write!(out, "{}{}", hexdump[row], parsed[row])?;
     }
 
-    queue!(out, MoveTo(0, content_height as u16))?;
-    write!(out, "{status}")?;
+    for (offset, line) in status.into_iter().enumerate() {
+        queue!(out, MoveTo(0, (content_height + offset) as u16))?;
+        write!(out, "{line}")?;
+    }
     out.flush()
 }
 
@@ -719,10 +873,7 @@ fn render_frequency(state: &TuiState, width: usize, height: usize) -> Vec<String
             .into_iter()
             .take(inner_height.saturating_sub(1))
         {
-            lines.push(theme::paint(
-                theme::FREQUENCY,
-                columns.row(&entry.label, &entry.count.to_string(), "[+]"),
-            ));
+            lines.push(columns.styled_row(&entry, "[+]"));
         }
 
         lines
@@ -769,6 +920,40 @@ impl FrequencyColumns {
             fit_right(filter, self.filter),
         );
         fit(&line, self.width)
+    }
+
+    fn styled_row(self, entry: &FrequencyEntry, filter: &str) -> String {
+        format!(
+            "{} {} {}",
+            self.styled_label(entry),
+            theme::paint(
+                theme::FREQUENCY,
+                fit_right(&entry.count.to_string(), self.count)
+            ),
+            theme::paint(theme::FREQUENCY, fit_right(filter, self.filter)),
+        )
+    }
+
+    fn styled_label(self, entry: &FrequencyEntry) -> String {
+        let code = format!("#{}", entry.code);
+        let code_width = code.chars().count();
+        if self.label == 0 {
+            return String::new();
+        }
+        if code_width >= self.label {
+            return theme::paint(theme::FREQUENCY_CODE, fit(&code, self.label));
+        }
+
+        let interface = truncate_with_ellipsis(&entry.interface, self.label - code_width);
+        let padding = self
+            .label
+            .saturating_sub(interface.chars().count() + code_width);
+        format!(
+            "{}{}{}",
+            theme::paint(theme::FREQUENCY, interface),
+            theme::paint(theme::FREQUENCY_CODE, code),
+            theme::paint(theme::FREQUENCY, " ".repeat(padding)),
+        )
     }
 }
 
@@ -886,7 +1071,7 @@ fn help_lines(width: usize, height: usize) -> Vec<String> {
     .collect()
 }
 
-fn render_status(state: &TuiState, width: usize) -> String {
+fn render_status(state: &TuiState, width: usize) -> [String; 2] {
     let selected = if state.total_events == 0 {
         "0/0".to_owned()
     } else {
@@ -904,8 +1089,8 @@ fn render_status(state: &TuiState, width: usize) -> String {
         .android_sdk
         .map(|sdk| sdk.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
-    let text = format!(
-        "Family: {}  SDK: {}  Transactions: {}  Saved: {}  Window: {}-{}  History: {}  Recording: {}  Input: {}  Selected: {}  Uptime: {}s  q=quit h=help space=toggle c=clear",
+    let status_text = format!(
+        "Family: {}  SDK: {}  Transactions: {}  Saved: {}  Window: {}-{}  History: {}  Recording: {}  Input: {}  Selected: {}  Uptime: {}s",
         state.family,
         sdk,
         state.stats.captured,
@@ -918,7 +1103,12 @@ fn render_status(state: &TuiState, width: usize) -> String {
         selected,
         uptime
     );
-    theme::paint(theme::STATUS, fit(&text, width))
+    let key_text = "Keys: q=quit  h=help  space=toggle  c=clear  up/down=move  page up/down=page  home/end=jump";
+
+    [
+        theme::paint(theme::STATUS, fit(&status_text, width)),
+        theme::paint(theme::MUTED, fit(key_text, width)),
+    ]
 }
 
 fn render_panel(
@@ -1051,6 +1241,8 @@ impl TransactionSummary {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct FrequencyEntry {
     label: String,
+    interface: String,
+    code: u32,
     count: u64,
 }
 
@@ -1087,6 +1279,8 @@ fn frequency_entries(state: &TuiState) -> Vec<FrequencyEntry> {
         .iter()
         .map(|(key, count)| FrequencyEntry {
             label: key.label(),
+            interface: key.interface.clone(),
+            code: key.code,
             count: *count,
         })
         .collect::<Vec<_>>();
@@ -1109,7 +1303,8 @@ mod tests {
     use bt_decoder::AndroidPlatformMethods;
 
     use super::{
-        FrequencyColumns, FrequencyKey, TransactionColumns, TuiState, truncate_with_ellipsis,
+        FrequencyColumns, FrequencyEntry, FrequencyKey, TransactionColumns, TuiState,
+        frequency_entries, render_status, truncate_with_ellipsis,
     };
     use crate::tui_history::CaptureHistory;
 
@@ -1200,6 +1395,37 @@ mod tests {
         assert_eq!(row.chars().count(), 52);
         assert!(row.contains("..."));
         assert!(row.ends_with(" 12345    [+]"));
+    }
+
+    #[test]
+    fn frequency_styled_row_colors_code_separately() {
+        let columns = FrequencyColumns::new(40);
+        let entry = FrequencyEntry {
+            label: "android.os.IFoo#18".to_owned(),
+            interface: "android.os.IFoo".to_owned(),
+            code: 18,
+            count: 7,
+        };
+        let row = columns.styled_row(&entry, "[+]");
+        let plain = strip_ansi(&row);
+
+        assert!(row.contains("\x1b[38;5;226m#18"));
+        assert_eq!(plain.chars().count(), 40);
+        assert!(plain.contains("android.os.IFoo#18"));
+    }
+
+    #[test]
+    fn status_bar_separates_state_from_key_hints() {
+        let state = TuiState::new(12, 16, empty_stats(), true, Some(34), temp_path("status"));
+        let [status, keys] = render_status(&state, 96);
+        let status = strip_ansi(&status);
+        let keys = strip_ansi(&keys);
+
+        assert_eq!(status.chars().count(), 96);
+        assert_eq!(keys.chars().count(), 96);
+        assert!(status.contains("Family: 12"));
+        assert!(!status.contains("q=quit"));
+        assert!(keys.contains("Keys: q=quit"));
     }
 
     #[test]
@@ -1316,6 +1542,33 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn frequency_counts_follow_full_history_after_window_eviction() {
+        let path = temp_path("frequency-history");
+        let mut history = CaptureHistory::create(path.clone(), 2).expect("历史文件应可创建");
+        let mut state = TuiState::new(0, 2, empty_stats(), true, Some(34), path.clone());
+
+        for sequence in 0..128 {
+            let mut event = binder_event("android.os.IMessenger", 1, false);
+            event.sequence = sequence;
+            let index = history.append_for_test(event).expect("测试事件应可追加");
+            state.push_event(index, event);
+        }
+        state
+            .sync_frequency_counts(&history)
+            .expect("频率统计应可从完整历史同步");
+
+        assert_eq!(state.events.len(), 2);
+        assert_eq!(
+            frequency_entries(&state)
+                .first()
+                .map(|entry| (entry.label.as_str(), entry.count)),
+            Some(("android.os.IMessenger#1", 128))
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
     fn binder_event(interface: &str, code: u32, reply: bool) -> BinderEvent {
         let payload = parcel_payload(interface);
         let mut inline_payload = [0_u8; 256];
@@ -1377,6 +1630,23 @@ mod tests {
             captured: 0,
             filtered: 0,
         }
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut stripped = String::new();
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                for escaped in chars.by_ref() {
+                    if escaped == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                stripped.push(ch);
+            }
+        }
+        stripped
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
