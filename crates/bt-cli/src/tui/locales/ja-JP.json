@@ -1,0 +1,24 @@
+{
+  "unknown": "不明",
+  "boolean": {
+    "enabled": "オン",
+    "disabled": "オフ"
+  },
+  "focus": {
+    "transactions": "トランザクション",
+    "frequency": "頻度",
+    "hexdump": "Hexdump",
+    "parsed": "解析済みトランザクション"
+  },
+  "status": "ファミリー: {family}  SDK: {sdk}  フォーカス: {focus}  トランザクション: {transactions}  保存済み: {saved}  ウィンドウ: {window_start}-{window_end}  履歴: {history}  記録中: {recording}  入力: {input}  選択: {selected}  稼働: {uptime}秒",
+  "keys": {
+    "transactions": {
+      "template": "キー: tab=フォーカス切替  q=終了  {space}  c=クリア  up/down=トランザクション移動  page up/down=ページ  home/end=ジャンプ",
+      "recording_space": "space=記録を一時停止",
+      "paused_space": "space=記録を再開"
+    },
+    "frequency": "キー: tab=フォーカス切替  q=終了  space=インターフェース/コード切替  c=クリア  up/down=頻度を移動  page up/down=ページ  home/end=ジャンプ",
+    "hexdump": "キー: tab=フォーカス切替  q=終了  c=クリア  up/down=Hexdumpスクロール  page up/down=ページ  home/end=ジャンプ",
+    "parsed": "キー: tab=フォーカス切替  q=終了  c=クリア  up/down=解析結果スクロール  page up/down=ページ  home/end=ジャンプ"
+  }
+}

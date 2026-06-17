@@ -1,0 +1,24 @@
+{
+  "unknown": "unknown",
+  "boolean": {
+    "enabled": "True",
+    "disabled": "False"
+  },
+  "focus": {
+    "transactions": "Transactions",
+    "frequency": "Frequency",
+    "hexdump": "Hexdump",
+    "parsed": "Parsed Transaction"
+  },
+  "status": "Family: {family}  SDK: {sdk}  Focus: {focus}  Transactions: {transactions}  Saved: {saved}  Window: {window_start}-{window_end}  History: {history}  Recording: {recording}  Input: {input}  Selected: {selected}  Uptime: {uptime}s",
+  "keys": {
+    "transactions": {
+      "template": "Keys: tab=focus  q=quit  {space}  c=clear  up/down=move transaction  page up/down=page  home/end=jump",
+      "recording_space": "space=pause capture",
+      "paused_space": "space=resume capture"
+    },
+    "frequency": "Keys: tab=focus  q=quit  space=toggle interface/code  c=clear  up/down=move frequency  page up/down=page  home/end=jump",
+    "hexdump": "Keys: tab=focus  q=quit  c=clear  up/down=scroll hexdump  page up/down=page  home/end=jump",
+    "parsed": "Keys: tab=focus  q=quit  c=clear  up/down=scroll parsed transaction  page up/down=page  home/end=jump"
+  }
+}

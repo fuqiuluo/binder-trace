@@ -7,68 +7,39 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::fs::{File, OpenOptions};
 use std::future;
-use std::io::{self, Read, Stdout, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bt_agent::{BinderEvent, CaptureConfig, CaptureStats, SocketIpcClient, SocketIpcError};
 use bt_decoder::{AndroidPlatformMethods, parse_interface_token};
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{execute, queue};
+use crossterm::cursor::{Hide, Show};
+use crossterm::execute;
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::tui_history::{CaptureHistory, HistoryError};
 
-mod theme {
-    use std::fmt;
+mod i18n;
+mod input;
+mod render;
+mod text;
+mod theme;
 
-    use anstyle::{Ansi256Color, AnsiColor, Color, RgbColor, Style};
+use i18n::UiLanguage;
+use input::{RawFdSource, TtyInput, UiCommand};
+use render::{PARSED_LINE_COUNT, render};
 
-    pub const BORDER: Style = ansi256_fg(15);
-    pub const FOCUSED_BORDER: Style = ansi256_fg(120);
-    pub const FREQUENCY: Style = rgb_fg(176, 223, 226);
-    pub const FREQUENCY_CODE: Style = ansi256_fg(226);
-    pub const FREQUENCY_SELECTED: Style = black_on_rgb(176, 223, 226);
-    pub const MUTED: Style = Style::new().dimmed();
-    pub const TITLE: Style = Style::new().bold();
-    pub const SELECTED: Style = Style::new()
-        .fg_color(Some(Color::Ansi(AnsiColor::Black)))
-        .bg_color(Some(Color::Ansi(AnsiColor::Cyan)));
-    pub const STATUS: Style = SELECTED;
+#[cfg(test)]
+use text::{display_width, fit, truncate_with_ellipsis};
 
-    const fn ansi256_fg(index: u8) -> Style {
-        Style::new().fg_color(Some(Color::Ansi256(Ansi256Color(index))))
-    }
-
-    const fn rgb_fg(red: u8, green: u8, blue: u8) -> Style {
-        Style::new().fg_color(Some(Color::Rgb(RgbColor(red, green, blue))))
-    }
-
-    const fn black_on_rgb(red: u8, green: u8, blue: u8) -> Style {
-        Style::new()
-            .fg_color(Some(Color::Ansi(AnsiColor::Black)))
-            .bg_color(Some(Color::Rgb(RgbColor(red, green, blue))))
-    }
-
-    pub fn ansi256_fg_style(index: u8) -> Style {
-        ansi256_fg(index)
-    }
-
-    pub fn black_on_ansi256(index: u8) -> Style {
-        Style::new()
-            .fg_color(Some(Color::Ansi(AnsiColor::Black)))
-            .bg_color(Some(Color::Ansi256(Ansi256Color(index))))
-    }
-
-    pub fn paint(style: Style, text: impl fmt::Display) -> String {
-        format!("{style}{text}{style:#}")
-    }
-}
+#[cfg(test)]
+use render::{
+    FrequencyColumns, TransactionColumns, render_panel, render_status, transaction_color_index,
+    visible_window_bounds,
+};
 
 #[derive(Debug, Clone)]
 pub struct TuiConfig {
@@ -114,20 +85,6 @@ impl From<HistoryError> for TuiError {
     fn from(error: HistoryError) -> Self {
         Self::History(error)
     }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum UiCommand {
-    Quit,
-    Space,
-    Clear,
-    NextPane,
-    Up,
-    Down,
-    PageUp,
-    PageDown,
-    Home,
-    End,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -183,6 +140,7 @@ struct TuiState {
     recording: bool,
     focus: FocusPane,
     input_available: bool,
+    language: UiLanguage,
     android_sdk: Option<u16>,
     platform_methods: Option<AndroidPlatformMethods>,
     history_path: PathBuf,
@@ -216,6 +174,7 @@ impl TuiState {
             recording: true,
             focus: FocusPane::Transactions,
             input_available,
+            language: UiLanguage::detect(),
             android_sdk,
             platform_methods: android_sdk.map(AndroidPlatformMethods::new),
             history_path,
@@ -675,23 +634,6 @@ async fn run_tui_async(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RawFdSource {
-    fd: RawFd,
-}
-
-impl RawFdSource {
-    const fn new(fd: RawFd) -> Self {
-        Self { fd }
-    }
-}
-
-impl AsRawFd for RawFdSource {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
 async fn wait_readable(fd: &AsyncFd<RawFdSource>) -> io::Result<()> {
     let mut guard = fd.readable().await?;
     guard.clear_ready();
@@ -862,819 +804,6 @@ fn toggle_recording(
     Ok(())
 }
 
-struct TtyInput {
-    file: File,
-    original_termios: libc::termios,
-    parser: KeyParser,
-}
-
-impl TtyInput {
-    fn open() -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).open("/dev/tty")?;
-        let original_termios = get_termios(file.as_raw_fd())?;
-        let mut raw_termios = original_termios;
-
-        raw_termios.c_iflag &=
-            !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
-        raw_termios.c_oflag &= !libc::OPOST;
-        raw_termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
-        raw_termios.c_cc[libc::VMIN] = 0;
-        raw_termios.c_cc[libc::VTIME] = 0;
-        set_termios(file.as_raw_fd(), &raw_termios)?;
-
-        Ok(Self {
-            file,
-            original_termios,
-            parser: KeyParser::default(),
-        })
-    }
-
-    fn read_command(&mut self) -> io::Result<Option<UiCommand>> {
-        while poll_fd(self.file.as_raw_fd())? {
-            let mut bytes = [0_u8; 32];
-            let read = match self.file.read(&mut bytes) {
-                Ok(0) => return Ok(None),
-                Ok(read) => read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            };
-
-            for byte in bytes.into_iter().take(read) {
-                if let Some(command) = self.parser.push(byte) {
-                    return Ok(Some(command));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
-    }
-}
-
-impl Drop for TtyInput {
-    fn drop(&mut self) {
-        let _ = set_termios(self.file.as_raw_fd(), &self.original_termios);
-    }
-}
-
-#[derive(Debug, Default)]
-struct KeyParser {
-    escape: Vec<u8>,
-}
-
-impl KeyParser {
-    fn push(&mut self, byte: u8) -> Option<UiCommand> {
-        if self.escape.is_empty() {
-            return match byte {
-                b'q' | 0x03 => Some(UiCommand::Quit),
-                b' ' => Some(UiCommand::Space),
-                b'c' => Some(UiCommand::Clear),
-                b'\t' => Some(UiCommand::NextPane),
-                0x1b => {
-                    self.escape.push(byte);
-                    None
-                }
-                _ => None,
-            };
-        }
-
-        self.escape.push(byte);
-        if let Some(command) = escape_to_command(&self.escape) {
-            self.escape.clear();
-            return Some(command);
-        }
-        if !is_escape_prefix(&self.escape) {
-            self.escape.clear();
-        }
-
-        None
-    }
-}
-
-const ESCAPE_COMMANDS: &[(&[u8], UiCommand)] = &[
-    (b"\x1b[A", UiCommand::Up),
-    (b"\x1b[B", UiCommand::Down),
-    (b"\x1b[5~", UiCommand::PageUp),
-    (b"\x1b[6~", UiCommand::PageDown),
-    (b"\x1b[H", UiCommand::Home),
-    (b"\x1b[1~", UiCommand::Home),
-    (b"\x1bOH", UiCommand::Home),
-    (b"\x1b[F", UiCommand::End),
-    (b"\x1b[4~", UiCommand::End),
-    (b"\x1bOF", UiCommand::End),
-];
-
-fn escape_to_command(sequence: &[u8]) -> Option<UiCommand> {
-    ESCAPE_COMMANDS
-        .iter()
-        .find_map(|(candidate, command)| (*candidate == sequence).then_some(*command))
-}
-
-fn is_escape_prefix(sequence: &[u8]) -> bool {
-    ESCAPE_COMMANDS
-        .iter()
-        .any(|(candidate, _)| candidate.starts_with(sequence))
-}
-
-fn get_termios(fd: RawFd) -> io::Result<libc::termios> {
-    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-    // SAFETY: `termios` 指向未初始化但足够大的栈内存，`fd` 是当前进程打开的 tty fd。
-    let ret = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
-    if ret == 0 {
-        // SAFETY: `tcgetattr` 成功后已经完整初始化 `termios`。
-        Ok(unsafe { termios.assume_init() })
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn set_termios(fd: RawFd, termios: &libc::termios) -> io::Result<()> {
-    // SAFETY: `termios` 是有效引用，`fd` 是当前进程打开的 tty fd。
-    let ret = unsafe { libc::tcsetattr(fd, libc::TCSANOW, termios) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn poll_fd(fd: RawFd) -> io::Result<bool> {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-
-    loop {
-        // SAFETY: `pollfd` 指向栈上有效内存，长度参数与实际元素数量一致。
-        let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
-        if ret > 0 {
-            return Ok((pollfd.revents & libc::POLLIN) != 0);
-        }
-        if ret == 0 {
-            return Ok(false);
-        }
-
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-fn render(out: &mut Stdout, state: &TuiState) -> io::Result<()> {
-    const STATUS_HEIGHT: usize = 2;
-
-    let (width, height) = terminal::size().unwrap_or((120, 36));
-    let width = usize::from(width).max(72);
-    let height = usize::from(height).max(20);
-    let content_height = height.saturating_sub(STATUS_HEIGHT);
-    let top_height = ((content_height * 52) / 100).clamp(8, content_height.saturating_sub(6));
-    let bottom_height = content_height.saturating_sub(top_height).max(6);
-    let left_width = ((width * 56) / 100).clamp(38, width.saturating_sub(28));
-    let right_width = width.saturating_sub(left_width);
-
-    let transactions = render_transactions(state, left_width, top_height);
-    let frequency = render_frequency(state, right_width, top_height);
-    let hexdump = render_hexdump(state, left_width, bottom_height);
-    let parsed = render_parsed(state, right_width, bottom_height);
-    let status = render_status(state, width);
-
-    queue!(out, MoveTo(0, 0))?;
-
-    for row in 0..top_height {
-        queue!(out, MoveTo(0, row as u16))?;
-        write!(out, "{}{}", transactions[row], frequency[row])?;
-    }
-
-    for row in 0..bottom_height {
-        queue!(out, MoveTo(0, (top_height + row) as u16))?;
-        write!(out, "{}{}", hexdump[row], parsed[row])?;
-    }
-
-    for (offset, line) in status.into_iter().enumerate() {
-        queue!(out, MoveTo(0, (content_height + offset) as u16))?;
-        write!(out, "{line}")?;
-    }
-    out.flush()
-}
-
-fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<String> {
-    render_panel(
-        FocusPane::Transactions.title(),
-        state.focus == FocusPane::Transactions,
-        width,
-        height,
-        |inner_width, inner_height| {
-            let mut lines = Vec::with_capacity(inner_height);
-            let visible_rows = inner_height.saturating_sub(1);
-            let selected_offset = state
-                .events
-                .iter()
-                .position(|entry| entry.history_index == state.selected)
-                .unwrap_or_default();
-            let start = if selected_offset >= visible_rows {
-                selected_offset + 1 - visible_rows
-            } else {
-                0
-            };
-            let rows = (start..state.events.len().min(start + visible_rows))
-                .map(|index| {
-                    let entry = &state.events[index];
-                    let event = &entry.event;
-                    let summary = state.transaction_summary(event);
-                    (entry.history_index, event, summary)
-                })
-                .collect::<Vec<_>>();
-            let columns = TransactionColumns::new(
-                inner_width,
-                rows.iter()
-                    .any(|(_, _, summary)| !summary.method.is_empty()),
-            );
-            lines.push(theme::paint(theme::MUTED, columns.header()));
-
-            for (history_index, event, summary) in rows {
-                let fitted = columns.row(
-                    &event.sequence.to_string(),
-                    direction(event),
-                    summary.interface.as_str(),
-                    &summary.code.to_string(),
-                    summary.method,
-                    &format!("0x{:x}", event.data_size),
-                );
-                let color = transaction_color_index(&summary, event);
-                if history_index == state.selected {
-                    lines.push(theme::paint(theme::black_on_ansi256(color), fitted));
-                } else {
-                    lines.push(theme::paint(theme::ansi256_fg_style(color), fitted));
-                }
-            }
-
-            lines
-        },
-    )
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct TransactionColumns {
-    width: usize,
-    sequence: usize,
-    direction: usize,
-    interface: usize,
-    code: usize,
-    method: usize,
-    len: usize,
-}
-
-impl TransactionColumns {
-    fn new(width: usize, has_method: bool) -> Self {
-        const SEQUENCE_WIDTH: usize = 8;
-        const DIRECTION_WIDTH: usize = 5;
-        const CODE_WIDTH: usize = 10;
-        const LEN_WIDTH: usize = 8;
-        const MIN_INTERFACE_WIDTH: usize = 18;
-        const MAX_INTERFACE_WIDTH: usize = 56;
-        const MIN_METHOD_WIDTH: usize = 12;
-        const MAX_METHOD_WIDTH: usize = 28;
-
-        let gap_width = if has_method { 5 } else { 4 };
-        let available = width.saturating_sub(gap_width);
-        let sequence = SEQUENCE_WIDTH.min(available);
-        let remaining = available.saturating_sub(sequence);
-        let direction = DIRECTION_WIDTH.min(remaining);
-        let remaining = remaining.saturating_sub(direction);
-        let code = CODE_WIDTH.min(remaining);
-        let remaining = remaining.saturating_sub(code);
-        let len = LEN_WIDTH.min(remaining);
-        let remaining = remaining.saturating_sub(len);
-        let method = if has_method && remaining > MIN_INTERFACE_WIDTH {
-            let available_for_method = remaining.saturating_sub(MIN_INTERFACE_WIDTH);
-            if available_for_method >= MIN_METHOD_WIDTH {
-                MAX_METHOD_WIDTH.min(available_for_method)
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        let interface = remaining.saturating_sub(method).min(MAX_INTERFACE_WIDTH);
-
-        Self {
-            width,
-            sequence,
-            direction,
-            interface,
-            code,
-            method,
-            len,
-        }
-    }
-
-    fn header(self) -> String {
-        self.row("Seq", "Dir", "Interface", "#", "Method", "Len")
-    }
-
-    fn row(
-        self,
-        sequence: &str,
-        direction: &str,
-        interface: &str,
-        code: &str,
-        method: &str,
-        len: &str,
-    ) -> String {
-        let line = if self.method == 0 {
-            format!(
-                "{} {} {} {} {}",
-                fit_right(sequence, self.sequence),
-                fit(direction, self.direction),
-                fit(interface, self.interface),
-                fit_right(code, self.code),
-                fit_right(len, self.len),
-            )
-        } else {
-            format!(
-                "{} {} {} {} {} {}",
-                fit_right(sequence, self.sequence),
-                fit(direction, self.direction),
-                fit(interface, self.interface),
-                fit_right(code, self.code),
-                fit(method, self.method),
-                fit_right(len, self.len),
-            )
-        };
-        fit(&line, self.width)
-    }
-}
-
-const TRANSACTION_COLORS: &[u8] = &[
-    39, 45, 51, 81, 87, 111, 117, 123, 159, 177, 183, 189, 204, 207, 213, 219, 222, 228,
-];
-
-fn transaction_color_index(summary: &TransactionSummary, event: &BinderEvent) -> u8 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    if summary.interface.is_empty() {
-        hash = fnv1a(hash, b"<reply>");
-        hash = fnv1a(hash, &event.code.to_le_bytes());
-    } else {
-        hash = fnv1a(hash, summary.interface.as_bytes());
-    }
-
-    TRANSACTION_COLORS[(hash as usize) % TRANSACTION_COLORS.len()]
-}
-
-fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn render_frequency(state: &TuiState, width: usize, height: usize) -> Vec<String> {
-    render_panel(
-        FocusPane::Frequency.title(),
-        state.focus == FocusPane::Frequency,
-        width,
-        height,
-        |inner_width, inner_height| {
-            let columns = FrequencyColumns::new(inner_width);
-            let entries = frequency_entries(state);
-            let visible_rows = inner_height.saturating_sub(1);
-            let selected = state
-                .frequency_selected
-                .min(entries.len().saturating_sub(1));
-            let start = visible_start(selected, visible_rows, entries.len());
-            let mut lines = Vec::with_capacity(inner_height);
-            lines.push(theme::paint(theme::MUTED, columns.header()));
-
-            for (index, entry) in entries
-                .into_iter()
-                .enumerate()
-                .skip(start)
-                .take(inner_height.saturating_sub(1))
-            {
-                let filter = if state.disabled_frequency.contains(&entry.key()) {
-                    "off"
-                } else {
-                    "on"
-                };
-                lines.push(columns.styled_row(&entry, filter, index == selected));
-            }
-
-            lines
-        },
-    )
-}
-
-fn visible_start(selected: usize, visible_rows: usize, len: usize) -> usize {
-    if visible_rows == 0 || len <= visible_rows {
-        return 0;
-    }
-    if selected >= visible_rows {
-        (selected + 1 - visible_rows).min(len - visible_rows)
-    } else {
-        0
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct FrequencyColumns {
-    width: usize,
-    label: usize,
-    count: usize,
-    filter: usize,
-}
-
-impl FrequencyColumns {
-    fn new(width: usize) -> Self {
-        const GAP_WIDTH: usize = 2;
-        const COUNT_WIDTH: usize = 9;
-        const FILTER_WIDTH: usize = 6;
-
-        let available = width.saturating_sub(GAP_WIDTH);
-        let filter = FILTER_WIDTH.min(available);
-        let remaining = available.saturating_sub(filter);
-        let count = COUNT_WIDTH.min(remaining);
-        let label = remaining.saturating_sub(count);
-
-        Self {
-            width,
-            label,
-            count,
-            filter,
-        }
-    }
-
-    fn header(self) -> String {
-        self.row("Interface/Code", "Frequency", "Filter")
-    }
-
-    fn row(self, label: &str, count: &str, filter: &str) -> String {
-        let line = format!(
-            "{} {} {}",
-            fit(label, self.label),
-            fit_right(count, self.count),
-            fit_right(filter, self.filter),
-        );
-        fit(&line, self.width)
-    }
-
-    fn styled_row(self, entry: &FrequencyEntry, filter: &str, selected: bool) -> String {
-        let count = fit_right(&entry.count.to_string(), self.count);
-        let filter = fit_right(filter, self.filter);
-        if selected {
-            let separator = theme::paint(theme::FREQUENCY_SELECTED, " ");
-            return format!(
-                "{}{}{}{}{}",
-                self.styled_label(entry, true),
-                separator,
-                theme::paint(theme::FREQUENCY_SELECTED, count),
-                separator,
-                theme::paint(theme::FREQUENCY_SELECTED, filter),
-            );
-        }
-
-        format!(
-            "{} {} {}",
-            self.styled_label(entry, false),
-            theme::paint(theme::FREQUENCY, count),
-            theme::paint(theme::FREQUENCY, filter),
-        )
-    }
-
-    fn styled_label(self, entry: &FrequencyEntry, selected: bool) -> String {
-        let code = format!("#{}", entry.code);
-        let code_width = code.chars().count();
-        let label_style = if selected {
-            theme::FREQUENCY_SELECTED
-        } else {
-            theme::FREQUENCY
-        };
-        let code_style = if selected {
-            theme::FREQUENCY_SELECTED
-        } else {
-            theme::FREQUENCY_CODE
-        };
-        if self.label == 0 {
-            return String::new();
-        }
-        if code_width >= self.label {
-            return theme::paint(code_style, fit(&code, self.label));
-        }
-
-        let interface = truncate_with_ellipsis(&entry.interface, self.label - code_width);
-        let padding = self
-            .label
-            .saturating_sub(interface.chars().count() + code_width);
-        format!(
-            "{}{}{}",
-            theme::paint(label_style, interface),
-            theme::paint(code_style, code),
-            theme::paint(label_style, " ".repeat(padding)),
-        )
-    }
-}
-
-fn render_hexdump(state: &TuiState, width: usize, height: usize) -> Vec<String> {
-    render_panel(
-        FocusPane::Hexdump.title(),
-        state.focus == FocusPane::Hexdump,
-        width,
-        height,
-        |inner_width, inner_height| {
-            let Some(event) = state.selected_event() else {
-                return vec![dim_line("等待 binder_transaction 事件", inner_width)];
-            };
-
-            let bytes = event.payload_bytes();
-            if bytes.is_empty() {
-                return vec![dim_line("payload 为空或未捕获", inner_width)];
-            }
-
-            bytes
-                .chunks(16)
-                .skip(state.hexdump_scroll)
-                .take(inner_height)
-                .enumerate()
-                .map(|(row, chunk)| {
-                    let mut hex = String::new();
-                    let mut ascii = String::new();
-                    for byte in chunk {
-                        hex.push_str(&format!("{byte:02x} "));
-                        ascii.push(if byte.is_ascii_graphic() {
-                            char::from(*byte)
-                        } else {
-                            '.'
-                        });
-                    }
-                    let line = format!(
-                        "{:04x}  {:<48}  {}",
-                        (state.hexdump_scroll + row) * 16,
-                        hex,
-                        ascii
-                    );
-                    fit(&line, inner_width)
-                })
-                .collect()
-        },
-    )
-}
-
-const PARSED_LINE_COUNT: usize = 22;
-
-fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
-    render_panel(
-        FocusPane::Parsed.title(),
-        state.focus == FocusPane::Parsed,
-        width,
-        height,
-        |inner_width, inner_height| {
-            let Some(event) = state.selected_event() else {
-                return vec![dim_line("选择事件后显示解析结果", inner_width)];
-            };
-            let summary = state.transaction_summary(event);
-
-            let lines = [
-                theme::paint(theme::TITLE, fit("binder_transaction", inner_width)),
-                format!("interface: {}", summary.interface.as_str()),
-                format!("code: {}", summary.code),
-                format!("method: {}", summary.method),
-                format!("flags: 0x{:x}", event.flags),
-                format!("data_size: 0x{:x}", event.data_size),
-                format!("offsets_size: 0x{:x}", event.offsets_size),
-                format!("target_handle: {}", event.target_handle),
-                format!(
-                    "sender_pid/euid: {}/{}",
-                    event.sender_pid, event.sender_euid
-                ),
-                format!(
-                    "payload: {} bytes{}",
-                    event.payload_bytes().len(),
-                    if event.payload_truncated != 0 {
-                        " truncated"
-                    } else {
-                        ""
-                    }
-                ),
-                format!("direction: {}", direction(event)),
-                format!("transaction_debug_id: {}", event.transaction_debug_id),
-                format!("reply_to_debug_id: {}", event.reply_to_debug_id),
-                format!("sequence: {}", event.sequence),
-                format!("timestamp_ns: {}", event.timestamp_ns),
-                format!("tgid/pid: {}/{}", event.tgid, event.pid),
-                format!("uid: {}", event.uid),
-                format!("transaction: 0x{:016x}", event.transaction),
-                format!("proc: 0x{:016x}", event.proc),
-                format!("thread: 0x{:016x}", event.thread),
-                format!("extra_buffers_size: 0x{:x}", event.extra_buffers_size),
-                format!("lost_before: {}", event.lost_before),
-            ];
-
-            lines
-                .into_iter()
-                .enumerate()
-                .skip(state.parsed_scroll)
-                .take(inner_height)
-                .map(|(index, line)| {
-                    if index == 0 {
-                        line
-                    } else {
-                        fit(&line, inner_width)
-                    }
-                })
-                .collect()
-        },
-    )
-}
-
-fn render_status(state: &TuiState, width: usize) -> [String; 2] {
-    let selected = if state.total_events == 0 {
-        "0/0".to_owned()
-    } else {
-        format!("{}/{}", state.selected + 1, state.total_events)
-    };
-    let (window_start, window_end) = visible_window_bounds(state);
-    let uptime = state.start.elapsed().as_secs();
-    let recording = if state.recording { "True" } else { "False" };
-    let input = if state.input_available {
-        "True"
-    } else {
-        "False"
-    };
-    let sdk = state
-        .android_sdk
-        .map(|sdk| sdk.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let status_text = format!(
-        "Family: {}  SDK: {}  Focus: {}  Transactions: {}  Saved: {}  Window: {}-{}  History: {}  Recording: {}  Input: {}  Selected: {}  Uptime: {}s",
-        state.family,
-        sdk,
-        state.focus.title(),
-        state.stats.captured,
-        state.total_events,
-        window_start,
-        window_end,
-        state.history_path.display(),
-        recording,
-        input,
-        selected,
-        uptime
-    );
-    let key_text = key_hints(state);
-
-    [
-        theme::paint(theme::STATUS, fit(&status_text, width)),
-        theme::paint(theme::MUTED, fit(&key_text, width)),
-    ]
-}
-
-fn visible_window_bounds(state: &TuiState) -> (u64, u64) {
-    let start = state
-        .events
-        .front()
-        .map(|entry| entry.history_index)
-        .unwrap_or_default();
-    let end = state
-        .events
-        .back()
-        .map(|entry| entry.history_index + 1)
-        .unwrap_or(start);
-    (start, end)
-}
-
-fn key_hints(state: &TuiState) -> String {
-    match state.focus {
-        FocusPane::Transactions => {
-            let space = if state.recording {
-                "space=pause capture"
-            } else {
-                "space=resume capture"
-            };
-            format!(
-                "Keys: tab=focus  q=quit  {space}  c=clear  up/down=move transaction  page up/down=page  home/end=jump"
-            )
-        }
-        FocusPane::Frequency => {
-            "Keys: tab=focus  q=quit  space=toggle interface/code  c=clear  up/down=move frequency  page up/down=page  home/end=jump".to_owned()
-        }
-        FocusPane::Hexdump => {
-            "Keys: tab=focus  q=quit  c=clear  up/down=scroll hexdump  page up/down=page  home/end=jump".to_owned()
-        }
-        FocusPane::Parsed => {
-            "Keys: tab=focus  q=quit  c=clear  up/down=scroll parsed  page up/down=page  home/end=jump".to_owned()
-        }
-    }
-}
-
-fn render_panel(
-    title: &str,
-    focused: bool,
-    width: usize,
-    height: usize,
-    body: impl FnOnce(usize, usize) -> Vec<String>,
-) -> Vec<String> {
-    let width = width.max(8);
-    let height = height.max(3);
-    let inner_width = width.saturating_sub(2);
-    let inner_height = height.saturating_sub(2);
-    let mut lines = Vec::with_capacity(height);
-    let border_style = if focused {
-        theme::FOCUSED_BORDER
-    } else {
-        theme::BORDER
-    };
-
-    lines.push(top_border(title, width, focused, border_style));
-    for line in body(inner_width, inner_height)
-        .into_iter()
-        .take(inner_height)
-    {
-        lines.push(format!(
-            "{}{}{}",
-            theme::paint(border_style, "│"),
-            line,
-            theme::paint(border_style, "│")
-        ));
-    }
-
-    while lines.len() + 1 < height {
-        lines.push(format!(
-            "{}{}{}",
-            theme::paint(border_style, "│"),
-            " ".repeat(inner_width),
-            theme::paint(border_style, "│")
-        ));
-    }
-
-    lines.push(theme::paint(
-        border_style,
-        format!("└{}┘", "─".repeat(inner_width)),
-    ));
-    lines
-}
-
-fn top_border(title: &str, width: usize, focused: bool, style: anstyle::Style) -> String {
-    let inner_width = width.saturating_sub(2);
-    let title = if focused {
-        format!(" [{title}] ")
-    } else {
-        format!(" {title} ")
-    };
-    if title.len() >= inner_width {
-        return theme::paint(style, format!("┌{}┐", fit(&title, inner_width)));
-    }
-
-    let left = (inner_width - title.len()) / 2;
-    let right = inner_width - title.len() - left;
-    theme::paint(
-        style,
-        format!("┌{}{}{}┐", "─".repeat(left), title, "─".repeat(right)),
-    )
-}
-
-fn dim_line(text: &str, width: usize) -> String {
-    theme::paint(theme::MUTED, fit(text, width))
-}
-
-fn fit(text: &str, width: usize) -> String {
-    let mut result = truncate_with_ellipsis(text, width);
-    let visible = result.chars().count();
-    if visible < width {
-        result.push_str(&" ".repeat(width - visible));
-    }
-    result
-}
-
-fn fit_right(text: &str, width: usize) -> String {
-    let result = truncate_with_ellipsis(text, width);
-    let visible = result.chars().count();
-    if visible < width {
-        format!("{}{}", " ".repeat(width - visible), result)
-    } else {
-        result
-    }
-}
-
-fn truncate_with_ellipsis(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-
-    if text.chars().count() <= width {
-        return text.to_owned();
-    }
-
-    if width <= 3 {
-        return ".".repeat(width);
-    }
-
-    format!("{}...", text.chars().take(width - 3).collect::<String>())
-}
-
 fn direction(event: &BinderEvent) -> &'static str {
     if event.is_reply() { "reply" } else { "send" }
 }
@@ -1796,8 +925,9 @@ mod tests {
 
     use super::{
         FocusPane, FrequencyColumns, FrequencyEntry, FrequencyKey, TransactionColumns,
-        TransactionSummary, TuiState, UiCommand, fit, frequency_entries, render_panel,
-        render_status, transaction_color_index, truncate_with_ellipsis, visible_window_bounds,
+        TransactionSummary, TuiState, UiCommand, UiLanguage, display_width, fit, frequency_entries,
+        render_panel, render_status, transaction_color_index, truncate_with_ellipsis,
+        visible_window_bounds,
     };
     use crate::tui_history::CaptureHistory;
 
@@ -1809,12 +939,14 @@ mod tests {
         );
         assert_eq!(truncate_with_ellipsis("abcdef", 3), "...");
         assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+        assert_eq!(truncate_with_ellipsis("中文abcdef", 8), "中文a...");
+        assert_eq!(display_width(&fit("中文", 6)), 6);
     }
 
     #[test]
     fn transaction_columns_keep_row_width() {
         for width in [6, 24, 65, 100] {
-            let row = TransactionColumns::new(width, true).row(
+            let row = TransactionColumns::new_with_sequence_width(width, true, 9).row(
                 "123456789",
                 "send",
                 "android.app.IActivityManager",
@@ -1829,14 +961,31 @@ mod tests {
 
     #[test]
     fn transaction_columns_drop_method_when_empty() {
-        let header = TransactionColumns::new(80, false).header();
+        let header = TransactionColumns::new_with_sequence_width(80, false, 3).header();
 
         assert!(!header.contains("Method"));
     }
 
     #[test]
+    fn transaction_columns_shrink_sequence_padding_to_visible_rows() {
+        let columns = TransactionColumns::new_with_sequence_width(80, false, 3);
+        let header = columns.header();
+        let row = columns.row(
+            "716",
+            "send",
+            "android.hidl.base@1.0::IBase",
+            "256067662",
+            "",
+            "0x20",
+        );
+
+        assert!(header.starts_with("Seq Dir"));
+        assert!(row.starts_with("716 send"));
+    }
+
+    #[test]
     fn transaction_columns_do_not_stretch_interface_on_wide_terminals() {
-        let columns = TransactionColumns::new(180, true);
+        let columns = TransactionColumns::new_with_sequence_width(180, true, 3);
 
         assert_eq!(columns.interface, 56);
         assert_eq!(columns.method, 28);
@@ -1844,7 +993,7 @@ mod tests {
 
     #[test]
     fn transaction_columns_keep_full_u32_code_width() {
-        let columns = TransactionColumns::new(100, true);
+        let columns = TransactionColumns::new_with_sequence_width(100, true, 1);
         let row = columns.row(
             "1",
             "reply",
@@ -1860,7 +1009,7 @@ mod tests {
 
     #[test]
     fn transaction_columns_include_direction_header() {
-        let columns = TransactionColumns::new(80, true);
+        let columns = TransactionColumns::new_with_sequence_width(80, true, 3);
         let header = columns.header();
         let row = columns.row("1", "send", "android.os.IMessenger", "1", "send", "0x20");
 
@@ -2101,12 +1250,13 @@ mod tests {
     #[test]
     fn status_bar_separates_state_from_key_hints() {
         let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), temp_path("status"));
+        state.language = UiLanguage::English;
         let [status, keys] = render_status(&state, 96);
         let status = strip_ansi(&status);
         let keys = strip_ansi(&keys);
 
-        assert_eq!(status.chars().count(), 96);
-        assert_eq!(keys.chars().count(), 96);
+        assert_eq!(display_width(&status), 96);
+        assert_eq!(display_width(&keys), 96);
         assert!(status.contains("Family: 12"));
         assert!(!status.contains("q=quit"));
         assert!(status.contains("Focus: Transactions"));
@@ -2125,6 +1275,60 @@ mod tests {
         let keys = strip_ansi(&render_status(&state, 120)[1]);
         assert!(keys.contains("up/down=scroll hexdump"));
         assert!(!keys.contains("space="));
+    }
+
+    #[test]
+    fn status_bar_uses_detected_language_strings() {
+        let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), temp_path("zh"));
+        state.language = UiLanguage::Chinese;
+        state.focus = FocusPane::Frequency;
+
+        let status_text = state.language.status_text(&state, "0/0", "34", 0);
+        assert!(status_text.contains("协议族: 12"));
+        assert!(status_text.contains("焦点: 频率"));
+
+        let [status, keys] = render_status(&state, 120);
+        let status = strip_ansi(&status);
+        let keys = strip_ansi(&keys);
+
+        assert_eq!(display_width(&status), 120);
+        assert_eq!(display_width(&keys), 120);
+        assert!(keys.contains("按键: tab=切换窗口"));
+        assert!(keys.contains("space=过滤"));
+
+        state.language = UiLanguage::Japanese;
+        let status_text = state.language.status_text(&state, "0/0", "34", 0);
+        assert!(status_text.contains("ファミリー: 12"));
+        assert!(status_text.contains("フォーカス: 頻度"));
+
+        let [status, keys] = render_status(&state, 120);
+        let status = strip_ansi(&status);
+        let keys = strip_ansi(&keys);
+
+        assert_eq!(display_width(&status), 120);
+        assert_eq!(display_width(&keys), 120);
+        assert!(keys.contains("キー: tab=フォーカス切替"));
+        assert!(keys.contains("space=インターフェース/コード切替"));
+    }
+
+    #[test]
+    fn language_detection_parses_supported_locales() {
+        assert_eq!(UiLanguage::from_locale("zh-CN"), Some(UiLanguage::Chinese));
+        assert_eq!(
+            UiLanguage::from_locale("zh_Hant_HK"),
+            Some(UiLanguage::Chinese)
+        );
+        assert_eq!(UiLanguage::from_locale("ja-JP"), Some(UiLanguage::Japanese));
+        assert_eq!(
+            UiLanguage::from_locale("en-US.UTF-8"),
+            Some(UiLanguage::English)
+        );
+        assert_eq!(
+            UiLanguage::from_locale_list("fr_FR:ja_JP"),
+            Some(UiLanguage::Japanese)
+        );
+        assert_eq!(UiLanguage::from_locale("C"), None);
+        assert_eq!(UiLanguage::from_locale("fr-FR"), None);
     }
 
     #[test]

@@ -1,0 +1,24 @@
+{
+  "unknown": "未知",
+  "boolean": {
+    "enabled": "开",
+    "disabled": "关"
+  },
+  "focus": {
+    "transactions": "事务",
+    "frequency": "频率",
+    "hexdump": "十六进制",
+    "parsed": "解析事务"
+  },
+  "status": "协议族: {family}  SDK: {sdk}  焦点: {focus}  事务: {transactions}  已保存: {saved}  窗口: {window_start}-{window_end}  历史: {history}  采集: {recording}  输入: {input}  选中: {selected}  运行: {uptime}秒",
+  "keys": {
+    "transactions": {
+      "template": "按键: tab=切换窗口  q=退出  {space}  c=清空  up/down=滚动  page up/down=翻页  home/end=跳转",
+      "recording_space": "space=暂停采集",
+      "paused_space": "space=恢复采集"
+    },
+    "frequency": "按键: tab=切换窗口  q=退出  space=过滤  c=清空  up/down=滚动  page up/down=翻页  home/end=跳转",
+    "hexdump": "按键: tab=切换窗口  q=退出  c=清空  up/down=滚动  page up/down=翻页  home/end=跳转",
+    "parsed": "按键: tab=切换窗口  q=退出  c=清空  up/down=滚动  page up/down=翻页  home/end=跳转"
+  }
+}
