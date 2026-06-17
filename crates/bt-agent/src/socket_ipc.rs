@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use bt_common::MAX_INLINE_PAYLOAD;
 use thiserror::Error;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const BT_ABI_VERSION: u32 = 2;
 const BT_IOC_MAGIC: u32 = b'B' as u32;
@@ -184,7 +185,7 @@ pub struct CaptureStats {
 
 /// 内核通过 recvmsg 推送的 Binder 事件。
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
 pub struct BinderEvent {
     pub sequence: u64,
     pub timestamp_ns: u64,
@@ -356,6 +357,14 @@ impl SocketIpcClient {
         self.recv_event_with_flags(libc::MSG_DONTWAIT)
     }
 
+    /// 尝试把下一条事件直接读入调用方提供的事件槽位。
+    ///
+    /// 这个接口用于 TUI 的 mmap 历史文件：`recv` 的目标缓冲区可以直接是文件映射中的
+    /// 一个 `BinderEvent` 槽位，避免先读到临时对象再复制到磁盘缓存。
+    pub fn try_recv_event_into(&self, event: &mut BinderEvent) -> Result<bool, SocketIpcError> {
+        self.recv_event_into_with_flags(event, libc::MSG_DONTWAIT)
+    }
+
     fn family_looks_like_binder_trace(family: libc::c_int) -> bool {
         // SAFETY: `socket` 不持有 Rust 引用；参数是按 libc ABI 传递的整数，返回值立即检查。
         let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
@@ -433,6 +442,41 @@ impl SocketIpcClient {
 
         // SAFETY: 内核已经完整写入 `BinderEvent` 大小的数据。
         Ok(Some(unsafe { event.assume_init() }))
+    }
+
+    fn recv_event_into_with_flags(
+        &self,
+        event: &mut BinderEvent,
+        flags: libc::c_int,
+    ) -> Result<bool, SocketIpcError> {
+        let bytes = event.as_mut_bytes();
+        // SAFETY: `bytes` 是调用方提供的完整 `BinderEvent` 可写字节视图，fd 有效。
+        let ret = unsafe {
+            libc::recv(
+                self.fd.as_raw_fd(),
+                bytes.as_mut_ptr().cast::<c_void>(),
+                bytes.len(),
+                flags,
+            )
+        };
+        if ret < 0 {
+            let error = io::Error::last_os_error();
+            let raw_error = error.raw_os_error();
+            if raw_error == Some(libc::EAGAIN) || raw_error == Some(libc::EWOULDBLOCK) {
+                return Ok(false);
+            }
+            return Err(SocketIpcError::Io(error));
+        }
+
+        let actual = ret as usize;
+        if actual != bytes.len() {
+            return Err(SocketIpcError::ShortRead {
+                expected: bytes.len(),
+                actual,
+            });
+        }
+
+        Ok(true)
     }
 }
 

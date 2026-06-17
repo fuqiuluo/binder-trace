@@ -21,6 +21,7 @@ use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod tui;
+mod tui_history;
 
 fn main() -> ExitCode {
     init_tracing();
@@ -102,6 +103,13 @@ struct TuiCommand {
     #[arg(long, default_value_t = 250, help = "界面刷新间隔，单位毫秒")]
     refresh_ms: u64,
 
+    #[arg(
+        long,
+        value_name = "path",
+        help = "二进制事件历史文件路径，默认自动选择"
+    )]
+    history_path: Option<PathBuf>,
+
     #[arg(long, value_name = "tgid", help = "只捕获指定进程组")]
     tgid: Option<i32>,
 
@@ -145,6 +153,7 @@ impl TuiCommand {
                 refresh: Duration::from_millis(self.refresh_ms),
                 capture_config: (!self.no_enable).then_some(capture_config),
                 android_sdk: self.android_sdk.or_else(detect_android_sdk),
+                history_path: self.history_path,
             },
         )
         .map_err(CliError::Tui)
@@ -379,6 +388,8 @@ mod tests {
             "tui",
             "--rows",
             "8",
+            "--history-path",
+            "/data/local/tmp/custom.btcap",
             "--tgid",
             "123",
             "--uid",
@@ -390,6 +401,10 @@ mod tests {
             panic!("expected tui command");
         };
         assert_eq!(tui.rows, 8);
+        assert_eq!(
+            tui.history_path.as_deref(),
+            Some(std::path::Path::new("/data/local/tmp/custom.btcap"))
+        );
         assert_eq!(tui.tgid, Some(123));
         assert_eq!(tui.uid, Some(2000));
     }

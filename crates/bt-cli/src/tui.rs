@@ -10,6 +10,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Stdout, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bt_agent::{BinderEvent, CaptureConfig, CaptureStats, SocketIpcClient, SocketIpcError};
@@ -17,6 +18,8 @@ use bt_decoder::{AndroidPlatformMethods, parse_interface_token};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
+
+use crate::tui_history::{CaptureHistory, HistoryError};
 
 mod theme {
     use std::fmt;
@@ -43,18 +46,20 @@ mod theme {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TuiConfig {
     pub rows: usize,
     pub refresh: Duration,
     pub capture_config: Option<CaptureConfig>,
     pub android_sdk: Option<u16>,
+    pub history_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 pub enum TuiError {
     Socket(SocketIpcError),
     Io(io::Error),
+    History(HistoryError),
 }
 
 impl fmt::Display for TuiError {
@@ -62,6 +67,7 @@ impl fmt::Display for TuiError {
         match self {
             Self::Socket(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "{error}"),
+            Self::History(error) => write!(f, "{error}"),
         }
     }
 }
@@ -77,6 +83,12 @@ impl From<SocketIpcError> for TuiError {
 impl From<io::Error> for TuiError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<HistoryError> for TuiError {
+    fn from(error: HistoryError) -> Self {
+        Self::History(error)
     }
 }
 
@@ -99,13 +111,17 @@ struct TuiState {
     family: i32,
     capacity: usize,
     events: VecDeque<BinderEvent>,
-    selected: usize,
+    window_start: u64,
+    selected: u64,
+    total_events: u64,
+    frequency_counts: BTreeMap<FrequencyKey, u64>,
     stats: CaptureStats,
     recording: bool,
     help_visible: bool,
     input_available: bool,
     android_sdk: Option<u16>,
     platform_methods: Option<AndroidPlatformMethods>,
+    history_path: PathBuf,
     start: Instant,
 }
 
@@ -116,63 +132,106 @@ impl TuiState {
         stats: CaptureStats,
         input_available: bool,
         android_sdk: Option<u16>,
+        history_path: PathBuf,
     ) -> Self {
         Self {
             family,
             capacity: capacity.max(1),
             events: VecDeque::with_capacity(capacity.max(1)),
+            window_start: 0,
             selected: 0,
+            total_events: 0,
+            frequency_counts: BTreeMap::new(),
             stats,
             recording: true,
             help_visible: false,
             input_available,
             android_sdk,
             platform_methods: android_sdk.map(AndroidPlatformMethods::new),
+            history_path,
             start: Instant::now(),
         }
     }
 
-    fn push_event(&mut self, event: BinderEvent) {
-        let follows_tail = self.events.is_empty() || self.selected + 1 >= self.events.len();
+    fn push_event(&mut self, history_index: u64, event: BinderEvent) {
+        let follows_tail = self.total_events == 0 || self.selected + 1 >= self.total_events;
+        self.total_events = history_index + 1;
+        if let Some(key) = FrequencyKey::from_event(&event, self.platform_methods) {
+            *self.frequency_counts.entry(key).or_default() += 1;
+        }
+
+        if !follows_tail {
+            return;
+        }
+
+        if self.events.is_empty() {
+            self.window_start = history_index;
+        }
+
+        if self.window_start + self.events.len() as u64 != history_index {
+            self.events.clear();
+            self.window_start = history_index;
+        }
 
         if self.events.len() == self.capacity {
             self.events.pop_front();
-            self.selected = self.selected.saturating_sub(1);
+            self.window_start += 1;
         }
 
         self.events.push_back(event);
-        if follows_tail {
-            self.selected = self.events.len().saturating_sub(1);
-        }
+        self.selected = history_index;
     }
 
     fn clear(&mut self) {
         self.events.clear();
-        self.selected = 0;
+        self.window_start = self.total_events;
+        self.selected = self.total_events.saturating_sub(1);
     }
 
     fn selected_event(&self) -> Option<&BinderEvent> {
-        self.events.get(self.selected)
+        let offset = self.selected.checked_sub(self.window_start)?;
+        self.events.get(offset as usize)
     }
 
     fn move_selection(&mut self, command: UiCommand, page_size: usize) {
-        if self.events.is_empty() {
+        if self.total_events == 0 {
             self.selected = 0;
             return;
         }
 
-        let last = self.events.len() - 1;
+        let last = self.total_events - 1;
         self.selected = match command {
             UiCommand::Up => self.selected.saturating_sub(1),
             UiCommand::Down => (self.selected + 1).min(last),
-            UiCommand::PageUp => self.selected.saturating_sub(page_size.max(1)),
-            UiCommand::PageDown => (self.selected + page_size.max(1)).min(last),
+            UiCommand::PageUp => self.selected.saturating_sub(page_size.max(1) as u64),
+            UiCommand::PageDown => (self.selected + page_size.max(1) as u64).min(last),
             UiCommand::Home => 0,
             UiCommand::End => last,
             UiCommand::Quit | UiCommand::ToggleRecording | UiCommand::Clear | UiCommand::Help => {
                 self.selected
             }
         };
+    }
+
+    fn ensure_selected_loaded(&mut self, history: &CaptureHistory) -> Result<(), TuiError> {
+        if self.total_events == 0 || self.selection_is_loaded() {
+            return Ok(());
+        }
+
+        let capacity = self.capacity as u64;
+        let half_window = capacity / 2;
+        let max_start = self.total_events.saturating_sub(capacity);
+        let start = self.selected.saturating_sub(half_window).min(max_start);
+        let events = history.load_window(start, self.capacity)?;
+
+        self.window_start = start;
+        self.events = VecDeque::from(events);
+        Ok(())
+    }
+
+    fn selection_is_loaded(&self) -> bool {
+        let window_end = self.window_start + self.events.len() as u64;
+        self.selected >= self.window_start && self.selected < window_end
     }
 }
 
@@ -198,6 +257,10 @@ impl Drop for TerminalSession {
 }
 
 pub fn run_tui(client: &SocketIpcClient, family: i32, config: TuiConfig) -> Result<(), TuiError> {
+    let history_path = config
+        .history_path
+        .unwrap_or_else(CaptureHistory::default_path);
+    let mut history = CaptureHistory::create(history_path, config.rows.max(1))?;
     let mut terminal = TerminalSession::enter()?;
     let capture_guard = CaptureGuard::new(client, config.capture_config);
     let mut state = TuiState::new(
@@ -206,6 +269,7 @@ pub fn run_tui(client: &SocketIpcClient, family: i32, config: TuiConfig) -> Resu
         client.get_stats()?,
         terminal.input.is_some(),
         config.android_sdk,
+        history.path().to_path_buf(),
     );
     let refresh = config
         .refresh
@@ -234,6 +298,7 @@ pub fn run_tui(client: &SocketIpcClient, family: i32, config: TuiConfig) -> Resu
                 }
                 Ok(Some(command)) => {
                     state.move_selection(command, 10);
+                    state.ensure_selected_loaded(&history)?;
                     dirty = true;
                 }
                 Ok(None) => {}
@@ -246,9 +311,16 @@ pub fn run_tui(client: &SocketIpcClient, family: i32, config: TuiConfig) -> Resu
         }
 
         if client.poll_event(Duration::from_millis(20))? {
-            while let Some(event) = client.try_recv_event()? {
-                if state.recording && event.is_binder_transaction() {
-                    state.push_event(event);
+            if state.recording {
+                while let Some(index) =
+                    history.recv_next_matching(client, BinderEvent::is_binder_transaction)?
+                {
+                    let event = history.event_at(index)?;
+                    state.push_event(index, event);
+                    dirty = true;
+                }
+            } else {
+                while client.try_recv_event()?.is_some() {
                     dirty = true;
                 }
             }
@@ -256,6 +328,7 @@ pub fn run_tui(client: &SocketIpcClient, family: i32, config: TuiConfig) -> Resu
 
         if last_stats_at.elapsed() >= Duration::from_secs(1) {
             state.stats = client.get_stats()?;
+            history.flush_async()?;
             last_stats_at = Instant::now();
             dirty = true;
         }
@@ -513,8 +586,13 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
         |inner_width, inner_height| {
             let mut lines = Vec::with_capacity(inner_height);
             let visible_rows = inner_height.saturating_sub(1);
-            let start = if state.selected >= visible_rows {
-                state.selected + 1 - visible_rows
+            let selected_offset = state
+                .selected
+                .checked_sub(state.window_start)
+                .map(|offset| offset as usize)
+                .unwrap_or_default();
+            let start = if selected_offset >= visible_rows {
+                selected_offset + 1 - visible_rows
             } else {
                 0
             };
@@ -522,7 +600,7 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
                 .map(|index| {
                     let event = &state.events[index];
                     let summary = TransactionSummary::new(event, state.platform_methods);
-                    (index, event, summary)
+                    (state.window_start + index as u64, event, summary)
                 })
                 .collect::<Vec<_>>();
             let columns = TransactionColumns::new(
@@ -532,7 +610,7 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
             );
             lines.push(theme::paint(theme::MUTED, columns.header()));
 
-            for (index, event, summary) in rows {
+            for (history_index, event, summary) in rows {
                 let fitted = columns.row(
                     &event.sequence.to_string(),
                     summary.interface.as_str(),
@@ -540,7 +618,7 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
                     summary.method,
                     &format!("0x{:x}", event.data_size),
                 );
-                if index == state.selected {
+                if history_index == state.selected {
                     lines.push(theme::paint(theme::SELECTED, fitted));
                 } else if event.is_reply() {
                     lines.push(theme::paint(theme::TRANSACTION_REPLY, fitted));
@@ -809,11 +887,12 @@ fn help_lines(width: usize, height: usize) -> Vec<String> {
 }
 
 fn render_status(state: &TuiState, width: usize) -> String {
-    let selected = if state.events.is_empty() {
+    let selected = if state.total_events == 0 {
         "0/0".to_owned()
     } else {
-        format!("{}/{}", state.selected + 1, state.events.len())
+        format!("{}/{}", state.selected + 1, state.total_events)
     };
+    let window_end = state.window_start + state.events.len() as u64;
     let uptime = state.start.elapsed().as_secs();
     let recording = if state.recording { "True" } else { "False" };
     let input = if state.input_available {
@@ -826,8 +905,18 @@ fn render_status(state: &TuiState, width: usize) -> String {
         .map(|sdk| sdk.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     let text = format!(
-        "Family: {}  SDK: {}  Transactions: {}  Filter: [tgid=*, pid=*, uid=*]  Recording: {}  Input: {}  Selected: {}  Uptime: {}s  q=quit h=help space=toggle c=clear",
-        state.family, sdk, state.stats.captured, recording, input, selected, uptime
+        "Family: {}  SDK: {}  Transactions: {}  Saved: {}  Window: {}-{}  History: {}  Recording: {}  Input: {}  Selected: {}  Uptime: {}s  q=quit h=help space=toggle c=clear",
+        state.family,
+        sdk,
+        state.stats.captured,
+        state.total_events,
+        state.window_start,
+        window_end,
+        state.history_path.display(),
+        recording,
+        input,
+        selected,
+        uptime
     );
     theme::paint(theme::STATUS, fit(&text, width))
 }
@@ -987,24 +1076,18 @@ impl FrequencyKey {
         })
     }
 
-    fn label(self) -> String {
+    fn label(&self) -> String {
         format!("{}#{}", self.interface, self.code)
     }
 }
 
 fn frequency_entries(state: &TuiState) -> Vec<FrequencyEntry> {
-    let mut counts = BTreeMap::<FrequencyKey, u64>::new();
-    for event in &state.events {
-        if let Some(key) = FrequencyKey::from_event(event, state.platform_methods) {
-            *counts.entry(key).or_default() += 1;
-        }
-    }
-
-    let mut entries = counts
-        .into_iter()
+    let mut entries = state
+        .frequency_counts
+        .iter()
         .map(|(key, count)| FrequencyEntry {
             label: key.label(),
-            count,
+            count: *count,
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
@@ -1018,10 +1101,17 @@ fn frequency_entries(state: &TuiState) -> Vec<FrequencyEntry> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use bt_agent::BinderEvent;
+    use bt_agent::CaptureStats;
     use bt_decoder::AndroidPlatformMethods;
 
-    use super::{FrequencyColumns, FrequencyKey, TransactionColumns, truncate_with_ellipsis};
+    use super::{
+        FrequencyColumns, FrequencyKey, TransactionColumns, TuiState, truncate_with_ellipsis,
+    };
+    use crate::tui_history::CaptureHistory;
 
     #[test]
     fn truncation_marks_omitted_text() {
@@ -1083,7 +1173,7 @@ mod tests {
         let key = FrequencyKey::from_event(&event, Some(AndroidPlatformMethods::new(34)));
 
         assert_eq!(
-            key.map(FrequencyKey::label).as_deref(),
+            key.map(|key| key.label()).as_deref(),
             Some("android.net.INetworkStatsService#13")
         );
     }
@@ -1110,6 +1200,120 @@ mod tests {
         assert_eq!(row.chars().count(), 52);
         assert!(row.contains("..."));
         assert!(row.ends_with(" 12345    [+]"));
+    }
+
+    #[test]
+    fn selection_loads_missing_window_from_history() {
+        let path = temp_path("tui-window");
+        let mut history = CaptureHistory::create(path.clone(), 2).expect("历史文件应可创建");
+        for sequence in 0..5 {
+            let mut event = binder_event("android.os.IMessenger", sequence as u32, false);
+            event.sequence = sequence;
+            history.append_for_test(event).expect("测试事件应可追加");
+        }
+
+        let mut state = TuiState::new(0, 2, empty_stats(), true, Some(34), path.clone());
+        state.total_events = 5;
+        state.selected = 4;
+        state
+            .ensure_selected_loaded(&history)
+            .expect("缺失窗口应可从历史文件加载");
+
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(
+            state.selected_event().map(|event| event.sequence).as_ref(),
+            Some(&4)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tail_window_preserves_append_order() {
+        let path = temp_path("tail-order");
+        let mut state = TuiState::new(0, 3, empty_stats(), true, Some(34), path.clone());
+
+        for sequence in 0..6 {
+            let mut event = binder_event("android.os.IMessenger", sequence as u32, false);
+            event.sequence = sequence;
+            state.push_event(sequence, event);
+        }
+
+        assert_eq!(state.window_start, 3);
+        assert_eq!(state.selected, 5);
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn backscroll_keeps_window_until_tail_reload() {
+        let path = temp_path("backscroll-order");
+        let mut history = CaptureHistory::create(path.clone(), 2).expect("历史文件应可创建");
+        let mut state = TuiState::new(0, 2, empty_stats(), true, Some(34), path.clone());
+
+        for sequence in 0..3 {
+            let mut event = binder_event("android.os.IMessenger", sequence as u32, false);
+            event.sequence = sequence;
+            let index = history.append_for_test(event).expect("测试事件应可追加");
+            state.push_event(index, event);
+        }
+
+        state.selected = 0;
+        state
+            .ensure_selected_loaded(&history)
+            .expect("旧窗口应可从历史文件加载");
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        for sequence in 3..5 {
+            let mut event = binder_event("android.os.IMessenger", sequence as u32, false);
+            event.sequence = sequence;
+            let index = history.append_for_test(event).expect("测试事件应可追加");
+            state.push_event(index, event);
+        }
+
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        state.selected = state.total_events - 1;
+        state
+            .ensure_selected_loaded(&history)
+            .expect("尾部窗口应可从历史文件加载");
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     fn binder_event(interface: &str, code: u32, reply: bool) -> BinderEvent {
@@ -1163,5 +1367,26 @@ mod tests {
         while !output.len().is_multiple_of(4) {
             output.push(0);
         }
+    }
+
+    fn empty_stats() -> CaptureStats {
+        CaptureStats {
+            ioctl_hits: 0,
+            copy_to_user_hits: 0,
+            transaction_hits: 0,
+            captured: 0,
+            filtered: 0,
+        }
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("系统时间应晚于 UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "binder-trace-{name}-{}-{nanos}.btcap",
+            std::process::id()
+        ))
     }
 }

@@ -14,4 +14,6 @@ bt-decoder = { path = "../bt-decoder" }
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
 libc = "0.2.186"
+memmap2 = "0.9.10"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+zerocopy = { version = "0.8.52", features = ["derive"] }
