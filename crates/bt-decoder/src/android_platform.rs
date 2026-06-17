@@ -5,8 +5,8 @@
 //! - 解析 Binder Parcel 开头的 interface token。
 //!
 //! # 约束
-//! - 只覆盖 AOSP frameworks/base 中的平台接口；厂商和应用自定义接口返回空。
-//! - 方法表由脚本生成，源码来自 AOSP release 分支，不在运行时访问网络。
+//! - 覆盖 AOSP release 分支中的平台 AIDL，并保留少量非 AIDL Binder 接口。
+//! - 厂商、应用自定义接口返回空；运行时不访问网络。
 
 #[path = "android_platform_methods.rs"]
 mod android_platform_methods;
@@ -40,10 +40,14 @@ impl AndroidPlatformMethods {
     /// 查询平台 Binder 方法；非平台接口、未知 code 或不支持的 SDK 返回 `None`。
     pub fn lookup(self, interface: &str, code: u32) -> Option<AndroidPlatformMethod> {
         let sdk_mask = sdk_mask(self.sdk)?;
+        let entries = android_platform_methods::ANDROID_PLATFORM_METHODS;
+        let start = entries.partition_point(|entry| entry.is_before(interface, code));
 
-        android_platform_methods::ANDROID_PLATFORM_METHODS
+        entries
             .iter()
-            .find(|entry| entry.matches(interface, code, sdk_mask))
+            .skip(start)
+            .take_while(|entry| entry.same_key(interface, code))
+            .find(|entry| entry.matches_sdk(sdk_mask))
             .map(|entry| AndroidPlatformMethod {
                 interface: entry.interface,
                 code: entry.code,
@@ -79,8 +83,16 @@ pub(super) struct PlatformMethodEntry {
 }
 
 impl PlatformMethodEntry {
-    fn matches(&self, interface: &str, code: u32, sdk_mask: u16) -> bool {
-        self.interface == interface && self.code == code && (self.sdk_mask & sdk_mask) != 0
+    fn is_before(&self, interface: &str, code: u32) -> bool {
+        self.interface < interface || (self.interface == interface && self.code < code)
+    }
+
+    fn same_key(&self, interface: &str, code: u32) -> bool {
+        self.interface == interface && self.code == code
+    }
+
+    fn matches_sdk(&self, sdk_mask: u16) -> bool {
+        (self.sdk_mask & sdk_mask) != 0
     }
 }
 
@@ -149,6 +161,26 @@ mod tests {
         assert_eq!(
             sdk34.method_name_or_empty("android.database.IBulkCursor", 7),
             "close"
+        );
+        assert_eq!(
+            sdk34.method_name_or_empty("android.app.IActivityManager", 63),
+            "getIntentSenderWithFeature"
+        );
+        assert_eq!(
+            sdk34.method_name_or_empty("android.net.INetd", 18),
+            "setProcSysNet"
+        );
+        assert_eq!(
+            sdk34.method_name_or_empty("android.net.metrics.INetdEventListener", 3),
+            "onConnectEvent"
+        );
+        assert_eq!(
+            sdk34.method_name_or_empty("android.net.INetworkStatsService", 13),
+            "getTotalStats"
+        );
+        assert_eq!(
+            sdk34.method_name_or_empty("android.os.IServiceManager", 2),
+            "checkService"
         );
     }
 

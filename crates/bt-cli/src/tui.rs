@@ -511,21 +511,30 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
         width,
         height,
         |inner_width, inner_height| {
-            let columns = TransactionColumns::new(inner_width);
             let mut lines = Vec::with_capacity(inner_height);
-            lines.push(theme::paint(theme::MUTED, columns.header()));
-
             let visible_rows = inner_height.saturating_sub(1);
             let start = if state.selected >= visible_rows {
                 state.selected + 1 - visible_rows
             } else {
                 0
             };
+            let rows = (start..state.events.len().min(start + visible_rows))
+                .map(|index| {
+                    let event = &state.events[index];
+                    let summary = TransactionSummary::new(event, state.platform_methods);
+                    (index, event, summary)
+                })
+                .collect::<Vec<_>>();
+            let columns = TransactionColumns::new(
+                inner_width,
+                rows.iter()
+                    .any(|(_, _, summary)| !summary.method.is_empty()),
+            );
+            lines.push(theme::paint(theme::MUTED, columns.header()));
 
-            for index in start..state.events.len().min(start + visible_rows) {
-                let event = &state.events[index];
-                let summary = TransactionSummary::new(event, state.platform_methods);
+            for (index, event, summary) in rows {
                 let fitted = columns.row(
+                    &event.sequence.to_string(),
                     summary.interface.as_str(),
                     &event.code.to_string(),
                     summary.method,
@@ -547,6 +556,8 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct TransactionColumns {
+    width: usize,
+    sequence: usize,
     interface: usize,
     code: usize,
     method: usize,
@@ -554,26 +565,31 @@ struct TransactionColumns {
 }
 
 impl TransactionColumns {
-    fn new(width: usize) -> Self {
-        const GAP_WIDTH: usize = 3;
-        const CODE_WIDTH: usize = 10;
-        const LEN_WIDTH: usize = 10;
-        const MIN_INTERFACE_WIDTH: usize = 10;
-        const PREFERRED_METHOD_WIDTH: usize = 22;
+    fn new(width: usize, has_method: bool) -> Self {
+        const SEQUENCE_WIDTH: usize = 8;
+        const CODE_WIDTH: usize = 6;
+        const LEN_WIDTH: usize = 8;
+        const MIN_INTERFACE_WIDTH: usize = 18;
+        const PREFERRED_METHOD_WIDTH: usize = 18;
 
-        let available = width.saturating_sub(GAP_WIDTH);
-        let code = CODE_WIDTH.min(available);
-        let remaining = available.saturating_sub(code);
+        let gap_width = if has_method { 4 } else { 3 };
+        let available = width.saturating_sub(gap_width);
+        let sequence = SEQUENCE_WIDTH.min(available);
+        let remaining = available.saturating_sub(sequence);
+        let code = CODE_WIDTH.min(remaining);
+        let remaining = remaining.saturating_sub(code);
         let len = LEN_WIDTH.min(remaining);
         let remaining = remaining.saturating_sub(len);
-        let method = if remaining > MIN_INTERFACE_WIDTH {
+        let method = if has_method && remaining > MIN_INTERFACE_WIDTH {
             PREFERRED_METHOD_WIDTH.min(remaining - MIN_INTERFACE_WIDTH)
         } else {
-            remaining / 3
+            0
         };
         let interface = remaining.saturating_sub(method);
 
         Self {
+            width,
+            sequence,
             interface,
             code,
             method,
@@ -582,17 +598,29 @@ impl TransactionColumns {
     }
 
     fn header(self) -> String {
-        self.row("Interface", "#", "Method", "Len")
+        self.row("Seq", "Interface", "#", "Method", "Len")
     }
 
-    fn row(self, interface: &str, code: &str, method: &str, len: &str) -> String {
-        format!(
-            "{} {} {} {}",
-            fit(interface, self.interface),
-            fit_right(code, self.code),
-            fit(method, self.method),
-            fit_right(len, self.len),
-        )
+    fn row(self, sequence: &str, interface: &str, code: &str, method: &str, len: &str) -> String {
+        let line = if self.method == 0 {
+            format!(
+                "{} {} {} {}",
+                fit_right(sequence, self.sequence),
+                fit(interface, self.interface),
+                fit_right(code, self.code),
+                fit_right(len, self.len),
+            )
+        } else {
+            format!(
+                "{} {} {} {} {}",
+                fit_right(sequence, self.sequence),
+                fit(interface, self.interface),
+                fit_right(code, self.code),
+                fit(method, self.method),
+                fit_right(len, self.len),
+            )
+        };
+        fit(&line, self.width)
     }
 }
 
@@ -821,7 +849,7 @@ fn dim_line(text: &str, width: usize) -> String {
 }
 
 fn fit(text: &str, width: usize) -> String {
-    let mut result: String = text.chars().take(width).collect();
+    let mut result = truncate_with_ellipsis(text, width);
     let visible = result.chars().count();
     if visible < width {
         result.push_str(&" ".repeat(width - visible));
@@ -830,13 +858,29 @@ fn fit(text: &str, width: usize) -> String {
 }
 
 fn fit_right(text: &str, width: usize) -> String {
-    let result: String = text.chars().take(width).collect();
+    let result = truncate_with_ellipsis(text, width);
     let visible = result.chars().count();
     if visible < width {
         format!("{}{}", " ".repeat(width - visible), result)
     } else {
         result
     }
+}
+
+fn truncate_with_ellipsis(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+
+    format!("{}...", text.chars().take(width - 3).collect::<String>())
 }
 
 fn direction(event: &BinderEvent) -> &'static str {
@@ -895,4 +939,41 @@ fn frequency_entries(state: &TuiState) -> Vec<FrequencyEntry> {
             .then_with(|| left.label.cmp(&right.label))
     });
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TransactionColumns, truncate_with_ellipsis};
+
+    #[test]
+    fn truncation_marks_omitted_text() {
+        assert_eq!(
+            truncate_with_ellipsis("android.app.IActivityManager", 14),
+            "android.app..."
+        );
+        assert_eq!(truncate_with_ellipsis("abcdef", 3), "...");
+        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+    }
+
+    #[test]
+    fn transaction_columns_keep_row_width() {
+        for width in [6, 24, 65, 100] {
+            let row = TransactionColumns::new(width, true).row(
+                "123456789",
+                "android.app.IActivityManager",
+                "1000000",
+                "someExtremelyLongMethodName",
+                "0x123456789",
+            );
+
+            assert_eq!(row.chars().count(), width);
+        }
+    }
+
+    #[test]
+    fn transaction_columns_drop_method_when_empty() {
+        let header = TransactionColumns::new(80, false).header();
+
+        assert!(!header.contains("Method"));
+    }
 }
