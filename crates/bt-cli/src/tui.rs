@@ -567,10 +567,12 @@ struct TransactionColumns {
 impl TransactionColumns {
     fn new(width: usize, has_method: bool) -> Self {
         const SEQUENCE_WIDTH: usize = 8;
-        const CODE_WIDTH: usize = 6;
+        const CODE_WIDTH: usize = 10;
         const LEN_WIDTH: usize = 8;
         const MIN_INTERFACE_WIDTH: usize = 18;
-        const PREFERRED_METHOD_WIDTH: usize = 18;
+        const MAX_INTERFACE_WIDTH: usize = 56;
+        const MIN_METHOD_WIDTH: usize = 12;
+        const MAX_METHOD_WIDTH: usize = 28;
 
         let gap_width = if has_method { 4 } else { 3 };
         let available = width.saturating_sub(gap_width);
@@ -581,11 +583,16 @@ impl TransactionColumns {
         let len = LEN_WIDTH.min(remaining);
         let remaining = remaining.saturating_sub(len);
         let method = if has_method && remaining > MIN_INTERFACE_WIDTH {
-            PREFERRED_METHOD_WIDTH.min(remaining - MIN_INTERFACE_WIDTH)
+            let available_for_method = remaining.saturating_sub(MIN_INTERFACE_WIDTH);
+            if available_for_method >= MIN_METHOD_WIDTH {
+                MAX_METHOD_WIDTH.min(available_for_method)
+            } else {
+                0
+            }
         } else {
             0
         };
-        let interface = remaining.saturating_sub(method);
+        let interface = remaining.saturating_sub(method).min(MAX_INTERFACE_WIDTH);
 
         Self {
             width,
@@ -975,5 +982,27 @@ mod tests {
         let header = TransactionColumns::new(80, false).header();
 
         assert!(!header.contains("Method"));
+    }
+
+    #[test]
+    fn transaction_columns_do_not_stretch_interface_on_wide_terminals() {
+        let columns = TransactionColumns::new(180, true);
+
+        assert_eq!(columns.interface, 56);
+        assert_eq!(columns.method, 28);
+    }
+
+    #[test]
+    fn transaction_columns_keep_full_u32_code_width() {
+        let columns = TransactionColumns::new(100, true);
+        let row = columns.row(
+            "1",
+            "android.content.pm.IPackageManager",
+            "4294967295",
+            "method",
+            "0x10",
+        );
+
+        assert!(row.contains("4294967295"));
     }
 }
