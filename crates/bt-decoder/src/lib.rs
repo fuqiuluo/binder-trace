@@ -10,7 +10,10 @@ mod decoder;
 mod error;
 mod event;
 
-pub use android_platform::{AndroidPlatformMethod, AndroidPlatformMethods, parse_interface_token};
+pub use android_platform::{
+    AndroidPlatformMethod, AndroidPlatformMethods, AndroidPlatformMethodsPathError,
+    parse_interface_token, set_android_platform_methods_tsv_path,
+};
 pub use config::DecoderConfig;
 pub use decoder::Decoder;
 pub use error::DecodeError;

@@ -10,3 +10,7 @@ name = "bt_decoder"
 [dependencies]
 bt-common = { path = "../bt-common" }
 csv = "1.4.0"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+
+[build-dependencies]
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }

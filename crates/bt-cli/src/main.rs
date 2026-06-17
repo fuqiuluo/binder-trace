@@ -17,6 +17,7 @@ use bt_agent::{
     Agent, AgentConfig, AgentError, CaptureConfig, DriverFeature, OutputConfig, SocketIpcClient,
     SocketIpcError,
 };
+use bt_decoder::{AndroidPlatformMethodsPathError, set_android_platform_methods_tsv_path};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -55,6 +56,14 @@ struct Cli {
 
     #[arg(long, value_name = "id", help = "覆盖消息信封中的 device_id")]
     device_id: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "path",
+        help = "平台 Binder method TSV 释放/覆盖路径，也可用 BINDER_TRACE_ANDROID_PLATFORM_METHODS_TSV"
+    )]
+    platform_methods_tsv: Option<PathBuf>,
 }
 
 impl Cli {
@@ -63,7 +72,12 @@ impl Cli {
             command,
             output,
             device_id,
+            platform_methods_tsv,
         } = self;
+
+        if let Some(path) = platform_methods_tsv {
+            set_android_platform_methods_tsv_path(path)?;
+        }
 
         match command {
             Some(Command::Ipc(args)) => args.command.run(),
@@ -250,6 +264,7 @@ enum CliError {
     SocketIpc(SocketIpcError),
     Io(io::Error),
     Tui(tui::TuiError),
+    PlatformMethods(AndroidPlatformMethodsPathError),
     EventStreamUnsupported,
 }
 
@@ -260,6 +275,7 @@ impl fmt::Display for CliError {
             Self::SocketIpc(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Tui(error) => write!(f, "{error}"),
+            Self::PlatformMethods(error) => write!(f, "{error}"),
             Self::EventStreamUnsupported => {
                 write!(
                     f,
@@ -281,6 +297,12 @@ impl From<SocketIpcError> for CliError {
 impl From<io::Error> for CliError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<AndroidPlatformMethodsPathError> for CliError {
+    fn from(error: AndroidPlatformMethodsPathError) -> Self {
+        Self::PlatformMethods(error)
     }
 }
 
@@ -360,6 +382,22 @@ mod tests {
             config.output,
             bt_agent::OutputConfig::JsonlFile(_)
         ));
+    }
+
+    #[test]
+    fn parses_platform_methods_tsv_path() {
+        let cli = Cli::try_parse_from([
+            "binder-trace",
+            "--platform-methods-tsv",
+            "/data/local/tmp/custom-methods.tsv",
+            "tui",
+        ])
+        .expect("method 表路径参数应可解析");
+
+        assert_eq!(
+            cli.platform_methods_tsv.as_deref(),
+            Some(std::path::Path::new("/data/local/tmp/custom-methods.tsv"))
+        );
     }
 
     #[test]

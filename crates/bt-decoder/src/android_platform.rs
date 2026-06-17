@@ -11,6 +11,10 @@
 #[path = "android_platform_methods.rs"]
 mod android_platform_methods;
 
+pub use android_platform_methods::{
+    AndroidPlatformMethodsPathError, set_android_platform_methods_tsv_path,
+};
+
 const MIN_ANDROID_SDK: u16 = 30;
 const MAX_ANDROID_SDK: u16 = 36;
 
@@ -165,7 +169,11 @@ mod tests {
 
     #[test]
     fn lookup_uses_sdk_specific_platform_table() {
+        let sdk32 = AndroidPlatformMethods::new(32);
+        let sdk33 = AndroidPlatformMethods::new(33);
         let sdk34 = AndroidPlatformMethods::new(34);
+        let sdk35 = AndroidPlatformMethods::new(35);
+        let sdk36 = AndroidPlatformMethods::new(36);
 
         assert_eq!(
             sdk34.method_name_or_empty("android.content.IContentProvider", 24),
@@ -194,6 +202,46 @@ mod tests {
         assert_eq!(
             sdk34.method_name_or_empty("android.net.INetworkStatsService", 13),
             "getTotalStats"
+        );
+        assert_eq!(
+            sdk32.method_name_or_empty("android.net.INetworkStatsService", 4),
+            "getDetailedUidStats"
+        );
+        assert_eq!(
+            sdk33.method_name_or_empty("android.net.INetworkStatsService", 4),
+            "getUidStatsForTransport"
+        );
+        assert_eq!(
+            sdk35.method_name_or_empty("android.net.INetworkStatsService", 18),
+            "clearTrafficStatsRateLimitCaches"
+        );
+        assert_eq!(
+            sdk36.method_name_or_empty("android.net.INetworkStatsService", 19),
+            "getRateLimitCacheConfig"
+        );
+        assert_eq!(
+            sdk35.method_name_or_empty("android.ui.ISurfaceComposer", 8),
+            "setTransactionState"
+        );
+        assert_eq!(
+            sdk35.method_name_or_empty("android.gui.SensorServer", 1),
+            "getSensorList"
+        );
+        assert_eq!(
+            sdk35.method_name_or_empty("android.hardware.sensors.ISensors", 5),
+            "getSensorsList"
+        );
+        assert_eq!(
+            sdk35.method_name_or_empty("android.system.keystore2.IKeystoreService", 1),
+            "getSecurityLevel"
+        );
+        assert_eq!(
+            sdk35.method_name_or_empty("android.hardware.security.keymint.IKeyMintDevice", 10),
+            "begin"
+        );
+        assert_eq!(
+            sdk35.method_name_or_empty("android.hardware.gatekeeper.IGatekeeper", 4),
+            "verify"
         );
         assert_eq!(
             sdk34.method_name_or_empty("android.os.IServiceManager", 2),
