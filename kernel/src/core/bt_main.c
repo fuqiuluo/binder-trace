@@ -1,4 +1,5 @@
 #include <linux/init.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/types.h>
 
@@ -87,12 +88,22 @@ static int __init bt_kmod_init(void)
 
 static void __exit bt_kmod_exit(void)
 {
+    int ret;
+
     if (bt_hide_module) {
         show_module();
     }
 
     bt_info("exit: 正在恢复 hook 并等待活跃调用退出\n");
-    bt_binder_hooks_remove();
+    ret = bt_binder_hooks_remove();
+    if (ret) {
+        bt_err("exit: 恢复 hook 失败: %d，模块不能安全卸载，阻塞退出避免入口跳到已释放代码\n",
+               ret);
+        for (;;) {
+            ssleep(60);
+        }
+    }
+
     bt_protocol_cleanup();
     bt_capture_cleanup();
     wuwa_inlinehook_cleanup();

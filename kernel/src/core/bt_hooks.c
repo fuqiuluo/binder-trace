@@ -437,7 +437,14 @@ int bt_binder_hooks_install(void)
         (void **)&bt_binder_hooks.binder_alloc_copy_user_to_buffer_backup,
         &bt_binder_hooks.binder_alloc_copy_user_to_buffer);
     if (ret) {
-        bt_binder_hooks_remove();
+        int remove_ret = bt_binder_hooks_remove();
+
+        if (remove_ret) {
+            bt_err("安装失败后回滚 Binder hook 失败: install=%d rollback=%d，保持模块加载避免悬挂入口\n",
+                   ret,
+                   remove_ret);
+            return 0;
+        }
         return ret;
     }
 
@@ -451,61 +458,122 @@ int bt_binder_hooks_install(void)
     return 0;
 }
 
-static void bt_disable_hook(
+static int bt_disable_hook(
     const char *name,
-    struct wuwa_inlinehook **hook)
+    struct wuwa_inlinehook **hook,
+    bool *disabled)
 {
     int ret;
 
+    *disabled = false;
     if (!*hook) {
-        return;
+        return 0;
     }
 
     ret = wuwa_disable_hook(*hook);
     if (ret) {
-        bt_err("移除 %s hook 失败: %d\n", name, ret);
-    } else {
-        bt_info("已恢复 %s hook 入口\n", name);
+        bt_err("恢复 %s hook 入口失败: %d，保留 hook/trampoline\n", name, ret);
+        return ret;
     }
+
+    *disabled = true;
+    bt_info("已恢复 %s hook 入口\n", name);
+    return 0;
 }
 
-static void bt_free_disabled_hook(
+static int bt_free_disabled_hook(
+    const char *name,
     struct wuwa_inlinehook **hook,
-    void **backup)
+    void **backup,
+    bool disabled)
 {
-    if (*hook) {
-        wuwa_free_hook(*hook);
+    int ret;
+
+    if (!*hook) {
+        *backup = NULL;
+        return 0;
+    }
+
+    if (!disabled) {
+        bt_err("跳过释放 %s hook: 入口未恢复，trampoline 仍可能被调用\n", name);
+        return -EBUSY;
+    }
+
+    ret = wuwa_free_hook(*hook);
+    if (ret) {
+        bt_err("释放 %s hook 失败: %d\n", name, ret);
+        return ret;
     }
 
     *hook = NULL;
     *backup = NULL;
+    return 0;
 }
 
-void bt_binder_hooks_remove(void)
+static void bt_record_first_error(int *first_ret, int ret)
 {
+    if (ret && !*first_ret) {
+        *first_ret = ret;
+    }
+}
+
+int bt_binder_hooks_remove(void)
+{
+    bool transaction_disabled;
+    bool copy_user_disabled;
+    bool ioctl_disabled;
+    int first_ret = 0;
+    int ret;
+
     WRITE_ONCE(bt_hooks_draining, true);
     bt_info("开始移除 Binder hook，停止新采集并等待已进入的调用返回\n");
 
-    bt_disable_hook(
+    ret = bt_disable_hook(
         "binder_transaction",
-        &bt_binder_hooks.binder_transaction);
-    bt_disable_hook(
+        &bt_binder_hooks.binder_transaction,
+        &transaction_disabled);
+    bt_record_first_error(&first_ret, ret);
+
+    ret = bt_disable_hook(
         "binder_alloc_copy_user_to_buffer",
-        &bt_binder_hooks.binder_alloc_copy_user_to_buffer);
-    bt_disable_hook(
+        &bt_binder_hooks.binder_alloc_copy_user_to_buffer,
+        &copy_user_disabled);
+    bt_record_first_error(&first_ret, ret);
+
+    ret = bt_disable_hook(
         "binder_ioctl",
-        &bt_binder_hooks.binder_ioctl);
+        &bt_binder_hooks.binder_ioctl,
+        &ioctl_disabled);
+    bt_record_first_error(&first_ret, ret);
 
     synchronize_rcu_tasks();
     bt_wait_for_active_hooks();
 
-    bt_free_disabled_hook(
+    ret = bt_free_disabled_hook(
+        "binder_transaction",
         &bt_binder_hooks.binder_transaction,
-        (void **)&bt_binder_hooks.binder_transaction_backup);
-    bt_free_disabled_hook(
+        (void **)&bt_binder_hooks.binder_transaction_backup,
+        transaction_disabled);
+    bt_record_first_error(&first_ret, ret);
+
+    ret = bt_free_disabled_hook(
+        "binder_alloc_copy_user_to_buffer",
         &bt_binder_hooks.binder_alloc_copy_user_to_buffer,
-        (void **)&bt_binder_hooks.binder_alloc_copy_user_to_buffer_backup);
-    bt_free_disabled_hook(
+        (void **)&bt_binder_hooks.binder_alloc_copy_user_to_buffer_backup,
+        copy_user_disabled);
+    bt_record_first_error(&first_ret, ret);
+
+    ret = bt_free_disabled_hook(
+        "binder_ioctl",
         &bt_binder_hooks.binder_ioctl,
-        (void **)&bt_binder_hooks.binder_ioctl_backup);
+        (void **)&bt_binder_hooks.binder_ioctl_backup,
+        ioctl_disabled);
+    bt_record_first_error(&first_ret, ret);
+
+    if (first_ret) {
+        bt_err("Binder hook 未完全移除，已保留未恢复 hook/trampoline: %d\n",
+               first_ret);
+    }
+
+    return first_ret;
 }

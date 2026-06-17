@@ -553,6 +553,10 @@ __nocfi int wuwa_disable_hook(struct wuwa_inlinehook* hook) {
     int ret = 0;
     uintptr_t origin = hook->addr.target_func;
 
+    if (hook->disabled) {
+        return 0;
+    }
+
     // 重新解析跳转链，确认实际恢复地址。
     ret = resolve_branch_chain(hook->addr.target_func, &origin);
     if (ret) {
@@ -569,16 +573,25 @@ __nocfi int wuwa_disable_hook(struct wuwa_inlinehook* hook) {
         return ret;
     }
 
+    hook->disabled = true;
     return ret;
 }
 
-__nocfi void wuwa_free_hook(struct wuwa_inlinehook* hook) {
+__nocfi int wuwa_free_hook(struct wuwa_inlinehook* hook) {
     if (!hook) {
-        return;
+        return 0;
+    }
+
+    if (!hook->disabled) {
+        wuwa_err("拒绝释放仍启用的 hook: target=0x%lx backup=0x%lx\n",
+                 hook->addr.resolved_addr,
+                 hook->addr.backup_addr);
+        return -EBUSY;
     }
 
     hook_restore_bti_guard_pages(hook);
     free_kernel_exec_memory(hook, sizeof(struct wuwa_inlinehook));
+    return 0;
 }
 
 __nocfi int wuwa_remove_hook(struct wuwa_inlinehook* hook) {
@@ -593,8 +606,7 @@ __nocfi int wuwa_remove_hook(struct wuwa_inlinehook* hook) {
      * 旧入口/trampoline 的任务离开代码修改窗口。
      */
     synchronize_rcu_tasks();
-    wuwa_free_hook(hook);
-    return 0;
+    return wuwa_free_hook(hook);
 }
 
 #endif /* INLINE_HOOK */

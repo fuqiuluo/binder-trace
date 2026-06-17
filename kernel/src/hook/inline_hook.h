@@ -117,6 +117,7 @@ struct wuwa_inlinehook {
     struct hook_address_info addr;  /**< 地址信息。 */
     struct hook_instruction_cache insn; /**< 指令缓存。 */
     struct hook_bti_guard_page bti_guard_pages[BTI_GUARD_PAGE_NUM];
+    bool disabled;                  /**< 入口是否已经恢复为原始指令。 */
 };
 
 #if defined(INLINE_HOOK)
@@ -178,8 +179,10 @@ int wuwa_disable_hook(struct wuwa_inlinehook* hook);
  * @brief 释放已经 disable 的 hook 结构体和 backup trampoline。
  *
  * @param hook `wuwa_install_hook` 返回的 hook 结构体指针。
+ *
+ * @return 成功返回 0，入口尚未恢复时返回 -EBUSY。
  */
-void wuwa_free_hook(struct wuwa_inlinehook* hook);
+int wuwa_free_hook(struct wuwa_inlinehook* hook);
 
 /**
  * @brief 移除 inline hook。
