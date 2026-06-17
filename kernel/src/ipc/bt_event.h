@@ -21,6 +21,8 @@ void bt_event_emit_binder_transaction(
     const void *thread,
     const void *tr,
     int reply,
+    __u32 transaction_debug_id,
+    __u32 reply_to_debug_id,
     unsigned long extra_buffers_size,
     __u32 code,
     __u32 transaction_flags,

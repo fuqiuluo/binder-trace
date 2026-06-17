@@ -10,7 +10,7 @@
 - `binder_alloc_copy_user_to_buffer`：必需 hook，用来拿到 Binder 写入用户态缓冲区前的入口参数。
 - `binder_transaction`：可选 hook。这个函数是 `static`，部分内核不会出现在 kallsyms 里，解析失败时模块会跳过它。
 
-跨版本策略：hook 层只读取函数入口参数，不解引用 `struct binder_proc`、`struct binder_thread`、`struct binder_buffer` 等 Binder 私有结构体字段。Android common 这些结构体不是 UAPI，字段布局会随内核分支变化，后续如果要解析字段，需要单独做版本适配。
+跨版本策略：hook 层默认只读取函数入口参数。为了把 reply 关联到对应 send，`binder_transaction` hook 额外 best-effort 读取 Android common 5.10-6.12/mainline 中相对稳定的最小私有字段：`binder_thread.transaction_stack` 和 `binder_transaction.debug_id`。这些字段不是 UAPI；读取不到或布局不匹配时事件中的 debug id 为 0，用户态应降级为 unmatched。
 
 ## 控制面 IPC
 
@@ -33,7 +33,7 @@
 - `BT_IOC_CLEAR_STATS`
 - `BT_IOC_GET_FEATURE`
 
-自定义协议族同时承载低频控制面和当前阶段的事件流：ioctl 负责开启/关闭捕获、基础过滤和统计读取，`recvmsg`/`poll`/`epoll` 负责读取内核推送的固定布局 Binder 事件。事件结构当前为 ABI v2，包含当前任务身份、`binder_transaction()` 入口指针、transaction code、data/offsets 大小、目标 handle、发送方 pid/euid，以及发送方用户态 Parcel 的前 256 字节。模块只读取 Android Binder UAPI 里稳定的 `struct binder_transaction_data` 字段，不解引用 `struct binder_proc`、`struct binder_thread` 等 Binder 私有结构体。
+自定义协议族同时承载低频控制面和当前阶段的事件流：ioctl 负责开启/关闭捕获、基础过滤和统计读取，`recvmsg`/`poll`/`epoll` 负责读取内核推送的固定布局 Binder 事件。事件结构当前为 ABI v3，包含当前任务身份、`binder_transaction()` 入口指针、transaction code、data/offsets 大小、目标 handle、发送方 pid/euid、reply 关联 debug id，以及发送方用户态 Parcel 的前 256 字节。
 
 ## 版本来源
 

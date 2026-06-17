@@ -10,7 +10,7 @@
  * SOCK_STREAM 返回 ENOKEY、SOCK_RAW 可创建的 family 后再发送 ioctl。
  */
 
-#define BT_ABI_VERSION 2U
+#define BT_ABI_VERSION 3U
 #define BT_IOC_MAGIC 'B'
 #define BT_DRIVER_FEATURE_MAGIC 0x4254524143453031ULL
 #define BT_DRIVER_FEATURE_NAME "binder-trace"
@@ -77,6 +77,8 @@ struct bt_binder_event {
     __u32 uid;
     __u32 reply;
     __u32 lost_before;
+    __u32 transaction_debug_id;
+    __u32 reply_to_debug_id;
     __u64 transaction;
     __u64 proc;
     __u64 thread;

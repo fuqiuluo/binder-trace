@@ -5,7 +5,9 @@
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
 #include <linux/rcupdate.h>
+#include <linux/rbtree.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -24,6 +26,25 @@ struct binder_proc;
 struct binder_thread;
 
 typedef uintptr_t bt_binder_size_t;
+
+/*
+ * 只读取跨 Android common 5.10-6.12/mainline 相对稳定的 Binder 私有字段。
+ * 这些不是 UAPI；读取失败或布局不匹配时只会让 debug id 为 0，用户态会降级
+ * 为 unmatched，不影响原始 binder_transaction()。
+ */
+struct bt_binder_thread_layout {
+    struct binder_proc *proc;
+    struct rb_node rb_node;
+    struct list_head waiting_thread_node;
+    int pid;
+    int looper;
+    bool looper_need_return;
+    struct binder_transaction *transaction_stack;
+};
+
+struct bt_binder_transaction_layout {
+    int debug_id;
+};
 
 typedef long (*bt_binder_ioctl_fn)(struct file *filp, unsigned int cmd, unsigned long arg);
 typedef unsigned long (*bt_binder_alloc_copy_user_to_buffer_fn)(
@@ -73,6 +94,46 @@ static void bt_wait_for_active_hooks(void)
         }
         msleep(20);
     }
+}
+
+static struct binder_transaction *bt_read_transaction_stack(const struct binder_thread *thread)
+{
+    const struct bt_binder_thread_layout *layout;
+    struct binder_transaction *transaction = NULL;
+
+    if (!thread) {
+        return NULL;
+    }
+
+    layout = (const struct bt_binder_thread_layout *)thread;
+    if (copy_from_kernel_nofault(
+            &transaction,
+            &layout->transaction_stack,
+            sizeof(transaction))) {
+        return NULL;
+    }
+
+    return transaction;
+}
+
+static __u32 bt_read_transaction_debug_id(const struct binder_transaction *transaction)
+{
+    const struct bt_binder_transaction_layout *layout;
+    int debug_id = 0;
+
+    if (!transaction) {
+        return 0;
+    }
+
+    layout = (const struct bt_binder_transaction_layout *)transaction;
+    if (copy_from_kernel_nofault(&debug_id, &layout->debug_id, sizeof(debug_id))) {
+        return 0;
+    }
+    if (debug_id <= 0) {
+        return 0;
+    }
+
+    return (__u32)debug_id;
 }
 
 /*
@@ -236,19 +297,48 @@ static __nocfi void bt_hook_binder_transaction(
     bt_binder_size_t extra_buffers_size)
 {
     __u8 payload[BT_MAX_INLINE_PAYLOAD] = {0};
+    struct binder_transaction *stack_before = NULL;
     __u32 payload_len = 0;
+    __u32 transaction_debug_id = 0;
+    __u32 reply_to_debug_id = 0;
     bool payload_truncated = false;
+    bool should_trace = false;
 
     bt_hook_enter();
 
-    if (!READ_ONCE(bt_hooks_draining) &&
-        bt_capture_should_trace(BT_CAPTURE_POINT_TRANSACTION, 0, (size_t)extra_buffers_size)) {
+    should_trace = !READ_ONCE(bt_hooks_draining) &&
+        bt_capture_should_trace(BT_CAPTURE_POINT_TRANSACTION, 0, (size_t)extra_buffers_size);
+    if (should_trace) {
+        stack_before = bt_read_transaction_stack(thread);
+        if (reply) {
+            reply_to_debug_id = bt_read_transaction_debug_id(stack_before);
+        }
         payload_len = bt_copy_transaction_payload(tr, payload, &payload_truncated);
+    }
+
+    if (!bt_binder_hooks.binder_transaction_backup) {
+        bt_err("binder_transaction backup 不存在\n");
+        goto out;
+    }
+
+    bt_binder_hooks.binder_transaction_backup(proc, thread, tr, reply, extra_buffers_size);
+
+    if (should_trace && !reply && tr && !(tr->flags & TF_ONE_WAY)) {
+        struct binder_transaction *stack_after = bt_read_transaction_stack(thread);
+
+        if (stack_after && stack_after != stack_before) {
+            transaction_debug_id = bt_read_transaction_debug_id(stack_after);
+        }
+    }
+
+    if (should_trace) {
         bt_event_emit_binder_transaction(
             proc,
             thread,
             tr,
             reply,
+            transaction_debug_id,
+            reply_to_debug_id,
             (unsigned long)extra_buffers_size,
             tr ? tr->code : 0,
             tr ? tr->flags : 0,
@@ -261,22 +351,17 @@ static __nocfi void bt_hook_binder_transaction(
             payload_len,
             payload_truncated);
         bt_info_ratelimited(
-            "binder_transaction proc=%px thread=%px tr=%px reply=%d code=%u size=0x%llx extra=0x%lx\n",
+            "binder_transaction proc=%px thread=%px tr=%px reply=%d code=%u txn_dbg=%u reply_to=%u size=0x%llx extra=0x%lx\n",
             proc,
             thread,
             tr,
             reply,
             tr ? tr->code : 0,
+            transaction_debug_id,
+            reply_to_debug_id,
             tr ? (unsigned long long)tr->data_size : 0,
             (unsigned long)extra_buffers_size);
     }
-
-    if (!bt_binder_hooks.binder_transaction_backup) {
-        bt_err("binder_transaction backup 不存在\n");
-        goto out;
-    }
-
-    bt_binder_hooks.binder_transaction_backup(proc, thread, tr, reply, extra_buffers_size);
 
 out:
     bt_hook_leave();

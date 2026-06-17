@@ -17,7 +17,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const MAGIC: [u8; 8] = *b"BTCEVT01";
 const FORMAT_VERSION: u32 = 1;
-const EVENT_ABI_VERSION: u32 = 2;
+const EVENT_ABI_VERSION: u32 = 3;
 const HEADER_SIZE: usize = size_of::<CaptureFileHeader>();
 const EVENT_SIZE: usize = size_of::<BinderEvent>();
 const DEFAULT_INITIAL_EVENTS: u64 = 65_536;
@@ -395,6 +395,8 @@ mod tests {
             uid: 0,
             reply: 0,
             lost_before: 0,
+            transaction_debug_id: 0,
+            reply_to_debug_id: 0,
             transaction: 0,
             proc: 0,
             thread: 0,

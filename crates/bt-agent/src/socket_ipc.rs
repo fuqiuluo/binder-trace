@@ -20,7 +20,7 @@ use bt_common::MAX_INLINE_PAYLOAD;
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-const BT_ABI_VERSION: u32 = 2;
+const BT_ABI_VERSION: u32 = 3;
 const BT_IOC_MAGIC: u32 = b'B' as u32;
 const BT_DRIVER_FEATURE_MAGIC: u64 = 0x4254_5241_4345_3031;
 const BT_FEATURE_EVENT_STREAM: u32 = 1 << 1;
@@ -195,6 +195,8 @@ pub struct BinderEvent {
     pub uid: u32,
     pub reply: u32,
     pub lost_before: u32,
+    pub transaction_debug_id: u32,
+    pub reply_to_debug_id: u32,
     pub transaction: u64,
     pub proc: u64,
     pub thread: u64,

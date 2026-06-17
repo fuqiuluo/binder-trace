@@ -173,6 +173,8 @@ struct TuiState {
     total_events: u64,
     frequency_counts: BTreeMap<FrequencyKey, u64>,
     frequency_counted_events: u64,
+    transaction_summaries: BTreeMap<u32, TransactionSummary>,
+    transaction_summary_indexed_events: u64,
     disabled_frequency: BTreeSet<FrequencyKey>,
     frequency_selected: usize,
     hexdump_scroll: usize,
@@ -204,6 +206,8 @@ impl TuiState {
             total_events: 0,
             frequency_counts: BTreeMap::new(),
             frequency_counted_events: 0,
+            transaction_summaries: BTreeMap::new(),
+            transaction_summary_indexed_events: 0,
             disabled_frequency: BTreeSet::new(),
             frequency_selected: 0,
             hexdump_scroll: 0,
@@ -226,6 +230,7 @@ impl TuiState {
             .map(|entry| self.selected == entry.history_index)
             .unwrap_or(true);
         self.total_events = history_index + 1;
+        self.observe_transaction_summary(&event);
 
         if !follows_tail || !self.displays_event(&event) {
             return;
@@ -242,6 +247,32 @@ impl TuiState {
         self.selected = history_index;
         self.hexdump_scroll = 0;
         self.parsed_scroll = 0;
+    }
+
+    fn observe_transaction_summary(&mut self, event: &BinderEvent) {
+        if event.is_reply() || event.transaction_debug_id == 0 {
+            return;
+        }
+
+        self.transaction_summaries.insert(
+            event.transaction_debug_id,
+            TransactionSummary::new(event, self.platform_methods),
+        );
+    }
+
+    fn transaction_summary(&self, event: &BinderEvent) -> TransactionSummary {
+        if event.is_reply()
+            && event.reply_to_debug_id != 0
+            && let Some(summary) = self.transaction_summaries.get(&event.reply_to_debug_id)
+        {
+            return summary.clone();
+        }
+
+        if event.is_reply() && event.reply_to_debug_id != 0 {
+            return TransactionSummary::unmatched_reply(event);
+        }
+
+        TransactionSummary::new(event, self.platform_methods)
     }
 
     fn focus_next(&mut self) {
@@ -317,6 +348,16 @@ impl TuiState {
                 *self.frequency_counts.entry(key).or_default() += 1;
             }
             self.frequency_counted_events += 1;
+        }
+
+        Ok(())
+    }
+
+    fn sync_transaction_summaries(&mut self, history: &CaptureHistory) -> Result<(), TuiError> {
+        while self.transaction_summary_indexed_events < history.event_count() {
+            let event = history.event_at(self.transaction_summary_indexed_events)?;
+            self.observe_transaction_summary(&event);
+            self.transaction_summary_indexed_events += 1;
         }
 
         Ok(())
@@ -731,6 +772,7 @@ fn drain_socket_events(
             changed = true;
         }
         if appended {
+            state.sync_transaction_summaries(history)?;
             state.sync_frequency_counts(history)?;
         }
     } else {
@@ -1038,7 +1080,7 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
                 .map(|index| {
                     let entry = &state.events[index];
                     let event = &entry.event;
-                    let summary = TransactionSummary::new(event, state.platform_methods);
+                    let summary = state.transaction_summary(event);
                     (entry.history_index, event, summary)
                 })
                 .collect::<Vec<_>>();
@@ -1054,7 +1096,7 @@ fn render_transactions(state: &TuiState, width: usize, height: usize) -> Vec<Str
                     &event.sequence.to_string(),
                     direction(event),
                     summary.interface.as_str(),
-                    &event.code.to_string(),
+                    &summary.code.to_string(),
                     summary.method,
                     &format!("0x{:x}", event.data_size),
                 );
@@ -1377,7 +1419,7 @@ fn render_hexdump(state: &TuiState, width: usize, height: usize) -> Vec<String> 
     )
 }
 
-const PARSED_LINE_COUNT: usize = 20;
+const PARSED_LINE_COUNT: usize = 22;
 
 fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
     render_panel(
@@ -1389,12 +1431,12 @@ fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
             let Some(event) = state.selected_event() else {
                 return vec![dim_line("选择事件后显示解析结果", inner_width)];
             };
-            let summary = TransactionSummary::new(event, state.platform_methods);
+            let summary = state.transaction_summary(event);
 
             let lines = [
                 theme::paint(theme::TITLE, fit("binder_transaction", inner_width)),
                 format!("interface: {}", summary.interface.as_str()),
-                format!("code: {}", event.code),
+                format!("code: {}", summary.code),
                 format!("method: {}", summary.method),
                 format!("flags: 0x{:x}", event.flags),
                 format!("data_size: 0x{:x}", event.data_size),
@@ -1414,6 +1456,8 @@ fn render_parsed(state: &TuiState, width: usize, height: usize) -> Vec<String> {
                     }
                 ),
                 format!("direction: {}", direction(event)),
+                format!("transaction_debug_id: {}", event.transaction_debug_id),
+                format!("reply_to_debug_id: {}", event.reply_to_debug_id),
                 format!("sequence: {}", event.sequence),
                 format!("timestamp_ns: {}", event.timestamp_ns),
                 format!("tgid/pid: {}/{}", event.tgid, event.pid),
@@ -1634,6 +1678,7 @@ fn direction(event: &BinderEvent) -> &'static str {
 struct TransactionSummary {
     interface: String,
     method: &'static str,
+    code: u32,
 }
 
 impl TransactionSummary {
@@ -1642,6 +1687,7 @@ impl TransactionSummary {
             return Self {
                 interface: String::new(),
                 method: "",
+                code: event.code,
             };
         }
 
@@ -1654,7 +1700,19 @@ impl TransactionSummary {
                 .unwrap_or("")
         };
 
-        Self { interface, method }
+        Self {
+            interface,
+            method,
+            code: event.code,
+        }
+    }
+
+    fn unmatched_reply(event: &BinderEvent) -> Self {
+        Self {
+            interface: format!("reply_to#{}", event.reply_to_debug_id),
+            method: "",
+            code: event.code,
+        }
     }
 }
 
@@ -1693,7 +1751,7 @@ impl FrequencyKey {
 
         Some(Self {
             interface: summary.interface,
-            code: event.code,
+            code: summary.code,
         })
     }
 
@@ -1843,6 +1901,75 @@ mod tests {
             FrequencyKey::from_event(&event, Some(AndroidPlatformMethods::new(34))),
             None
         );
+    }
+
+    #[test]
+    fn reply_summary_uses_correlated_send_debug_id() {
+        let mut state = TuiState::new(
+            12,
+            16,
+            empty_stats(),
+            true,
+            Some(34),
+            temp_path("reply-correlation"),
+        );
+        let mut send = binder_event("android.os.IMessenger", 1, false);
+        send.transaction_debug_id = 42;
+        let mut reply = binder_event("", 0, true);
+        reply.reply_to_debug_id = 42;
+
+        state.push_event(0, send);
+        state.push_event(1, reply);
+
+        let summary = state.transaction_summary(state.selected_event().expect("应选中 reply"));
+        assert_eq!(summary.interface, "android.os.IMessenger");
+        assert_eq!(summary.code, 1);
+    }
+
+    #[test]
+    fn reply_summary_uses_send_debug_id_from_history_index() {
+        let path = temp_path("reply-history-correlation");
+        let mut history = CaptureHistory::create(path.clone(), 4).expect("历史文件应可创建");
+        let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), path.clone());
+        let mut send = binder_event("android.os.IMessenger", 1, false);
+        send.transaction_debug_id = 77;
+        let mut reply = binder_event("", 0, true);
+        reply.reply_to_debug_id = 77;
+
+        history.append_for_test(send).expect("send 应可追加");
+        let reply_index = history.append_for_test(reply).expect("reply 应可追加");
+        state
+            .sync_transaction_summaries(&history)
+            .expect("摘要应可从历史回填");
+        state.push_event(
+            reply_index,
+            history.event_at(reply_index).expect("reply 应可从历史读取"),
+        );
+
+        let summary = state.transaction_summary(state.selected_event().expect("应选中 reply"));
+        assert_eq!(summary.interface, "android.os.IMessenger");
+        assert_eq!(summary.code, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unmatched_reply_summary_keeps_reply_to_debug_id_visible() {
+        let state = TuiState::new(
+            12,
+            16,
+            empty_stats(),
+            true,
+            Some(34),
+            temp_path("reply-unmatched"),
+        );
+        let mut reply = binder_event("", 0, true);
+        reply.reply_to_debug_id = 235453;
+
+        let summary = state.transaction_summary(&reply);
+
+        assert_eq!(summary.interface, "reply_to#235453");
+        assert_eq!(summary.code, 0);
     }
 
     #[test]
@@ -2228,6 +2355,8 @@ mod tests {
             uid: 0,
             reply: u32::from(reply),
             lost_before: 0,
+            transaction_debug_id: 0,
+            reply_to_debug_id: 0,
             transaction: 0,
             proc: 0,
             thread: 0,
