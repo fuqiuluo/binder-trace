@@ -281,7 +281,7 @@ int relo_adr(struct wuwa_inlinehook* hook, uint64_t inst_addr, uint32_t inst, in
     } else {
         addr = (inst_addr + SIGN64_EXTEND((immhi << 14u) | (immlo << 12u), 33u)) & 0xFFFFFFFFFFFFF000;
         if (is_in_tramp(hook, addr))
-            return -1;
+            return -EOPNOTSUPP;
     }
     buf[0] = 0x58000040u | xd; // LDR Xd, #8，加载重定位后的地址。
     buf[1] = 0x14000003; // B #12，跳过内嵌地址字面量。
@@ -299,7 +299,7 @@ int relo_ldr(struct wuwa_inlinehook* hook, uint64_t inst_addr, uint32_t inst, in
     uint64_t addr = inst_addr + offset;
 
     if (is_in_tramp(hook, addr) && type != INST_PRFM_LIT)
-        return -1;
+        return -EOPNOTSUPP;
 
     addr = relo_in_tramp(hook, addr);
 
@@ -436,9 +436,13 @@ static int relocate_inst(struct wuwa_inlinehook* hook, uintptr_t inst_addr, uint
         break;
     }
 
+    if (ret < 0) {
+        return ret;
+    }
+
     hook->insn.relocated_count += len;
 
-    return ret;
+    return 0;
 }
 
 __nocfi struct wuwa_inlinehook* wuwa_install_hook(void* target, void* replace, void** backup) {
@@ -503,12 +507,11 @@ __nocfi struct wuwa_inlinehook* wuwa_install_hook(void* target, void* replace, v
         uint64_t inst_addr = hook->addr.resolved_addr + i * INSTRUCTION_SIZE;
         uint32_t inst = hook->insn.saved_insns[i];
         int relo_res = relocate_inst(hook, inst_addr, inst);
-        if (relo_res == -EACCES || relo_res == -ENOSPC) {
+        if (relo_res < 0) {
+            wuwa_err("重定位入口指令失败: addr=0x%llx inst=0x%x ret=%d\n",
+                     (unsigned long long)inst_addr, inst, relo_res);
             ret = relo_res;
             goto err_free_hook;
-        }
-        if (relo_res < 0) {
-            // 单条重定位失败时先继续，后续需要按具体目标函数做兼容性验证。
         }
     }
 
