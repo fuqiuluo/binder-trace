@@ -206,6 +206,10 @@ kernel/scripts/insmod_ko.sh bt-kmod.ko
 
 内核模块事件 reader 接入后，采集事件会继续复用同一套消息信封，保证 `seq` 单调递增。
 
+## 致谢
+
+感谢 [foundryzero/binder-trace](https://github.com/foundryzero/binder-trace) 项目。
+
 ## 开发规范
 
 项目文档和代码要求见 [`docs/development-guidelines.md`](docs/development-guidelines.md)。
