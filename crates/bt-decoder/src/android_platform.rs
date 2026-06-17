@@ -71,6 +71,11 @@ pub fn parse_interface_token(payload: &[u8]) -> Option<String> {
     [12, 8, 4, 0]
         .into_iter()
         .find_map(|offset| read_string16(payload, offset))
+        .or_else(|| {
+            [0, 4, 8, 12]
+                .into_iter()
+                .find_map(|offset| read_c_string(payload, offset))
+        })
         .filter(|token| is_interface_descriptor(token))
 }
 
@@ -135,11 +140,23 @@ fn read_i32_le(payload: &[u8], offset: usize) -> Option<i32> {
     Some(i32::from_le_bytes(bytes.try_into().ok()?))
 }
 
+fn read_c_string(payload: &[u8], offset: usize) -> Option<String> {
+    let bytes = payload.get(offset..)?;
+    let length = bytes.iter().position(|byte| *byte == 0)?;
+    if length == 0 || length > 512 {
+        return None;
+    }
+
+    std::str::from_utf8(&bytes[..length])
+        .ok()
+        .map(ToOwned::to_owned)
+}
+
 fn is_interface_descriptor(token: &str) -> bool {
     token.contains('.')
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'$'))
+        && token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'$' | b'@' | b':')
+        })
 }
 
 #[cfg(test)]
@@ -208,6 +225,18 @@ mod tests {
         assert_eq!(
             parse_interface_token(&payload).as_deref(),
             Some("android.content.IContentProvider")
+        );
+    }
+
+    #[test]
+    fn parses_hidl_ascii_interface_token() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"android.hardware.wifi@1.5::IWifiStaIface");
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+
+        assert_eq!(
+            parse_interface_token(&payload).as_deref(),
+            Some("android.hardware.wifi@1.5::IWifiStaIface")
         );
     }
 

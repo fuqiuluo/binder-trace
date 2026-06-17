@@ -32,6 +32,7 @@ mod theme {
     pub const BORDER: Style = ansi256_fg(15);
     pub const FOCUSED_BORDER: Style = ansi256_fg(120);
     pub const FREQUENCY: Style = rgb_fg(176, 223, 226);
+    pub const FREQUENCY_CODE: Style = ansi256_fg(226);
     pub const FREQUENCY_SELECTED: Style = black_on_rgb(176, 223, 226);
     pub const MUTED: Style = Style::new().dimmed();
     pub const TITLE: Style = Style::new().bold();
@@ -1306,11 +1307,16 @@ impl FrequencyColumns {
         } else {
             theme::FREQUENCY
         };
+        let code_style = if selected {
+            theme::FREQUENCY_SELECTED
+        } else {
+            theme::FREQUENCY_CODE
+        };
         if self.label == 0 {
             return String::new();
         }
         if code_width >= self.label {
-            return theme::paint(label_style, fit(&code, self.label));
+            return theme::paint(code_style, fit(&code, self.label));
         }
 
         let interface = truncate_with_ellipsis(&entry.interface, self.label - code_width);
@@ -1320,7 +1326,7 @@ impl FrequencyColumns {
         format!(
             "{}{}{}",
             theme::paint(label_style, interface),
-            theme::paint(label_style, code),
+            theme::paint(code_style, code),
             theme::paint(label_style, " ".repeat(padding)),
         )
     }
@@ -1903,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn frequency_styled_row_uses_srgb_color() {
+    fn frequency_styled_row_uses_srgb_color_and_separate_code_color() {
         let columns = FrequencyColumns::new(40);
         let entry = FrequencyEntry {
             label: "android.os.IFoo#18".to_owned(),
@@ -1915,8 +1921,9 @@ mod tests {
         let plain = strip_ansi(&row);
 
         assert!(row.contains("\x1b[38;2;176;223;226mandroid.os.IFoo"));
-        assert!(row.contains("\x1b[38;2;176;223;226m#18"));
+        assert!(row.contains("\x1b[38;5;226m#18"));
         assert!(row.contains("\x1b[38;2;176;223;226m      7"));
+        assert!(!row.contains("\x1b[38;2;176;223;226m#18"));
         assert!(!row.contains("38;5;176"));
         assert_eq!(plain.chars().count(), 40);
         assert!(plain.contains("android.os.IFoo#18"));
