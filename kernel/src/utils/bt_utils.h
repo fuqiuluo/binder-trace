@@ -26,4 +26,8 @@ void *alloc_kernel_exec_memory(size_t size, bool force_rw);
 void free_kernel_exec_memory(void *addr, size_t size);
 void set_pte_at_ex(pte_t *ptep, pte_t pte);
 
+int cfi_bypass(void);
+void show_module(void);
+void hide_module(void);
+
 #endif /* BINDER_TRACE_KMOD_UTILS_H */

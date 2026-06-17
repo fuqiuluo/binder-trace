@@ -13,6 +13,7 @@ bt-kmod-y := \
     src/hook/inline_hook.o \
     src/utils/bt_kallsyms.o \
     src/utils/bt_mem.o \
+    src/utils/bt_module.o \
     src/utils/bt_pgtable.o
 
 src := $(if $(filter /%,$(src)),$(src),$(srctree)/$(src))

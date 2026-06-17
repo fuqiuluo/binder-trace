@@ -7,6 +7,7 @@
 #include "bt_hooks.h"
 #include "bt_protocol.h"
 #include "bt_symbols.h"
+#include "bt_utils.h"
 #include "hijack_arm64.h"
 #include "inline_hook.h"
 
@@ -15,6 +16,12 @@ module_param_named(preserve_bti, bt_preserve_bti, bool, 0444);
 MODULE_PARM_DESC(
     preserve_bti,
     "保留 hooked text 页的 BTI guard 属性，并使用 RET X17 跳回原函数");
+
+bool bt_hide_module = false;
+module_param_named(hide_module, bt_hide_module, bool, 0444);
+MODULE_PARM_DESC(
+    hide_module,
+    "隐藏内核模块的痕迹, 保证审计模块不会被恶意用户异常卸载!");
 
 static int __init bt_kmod_init(void)
 {
@@ -36,6 +43,8 @@ static int __init bt_kmod_init(void)
         bt_capture_cleanup();
         return ret;
     }
+
+    bt_info("CFI bypass patched functions: %d\n", cfi_bypass());
 
     ret = wuwa_inlinehook_init();
     if (ret) {
@@ -70,11 +79,18 @@ static int __init bt_kmod_init(void)
         return ret;
     }
 
+    if (bt_hide_module) {
+        hide_module();
+    }
     return 0;
 }
 
 static void __exit bt_kmod_exit(void)
 {
+    if (bt_hide_module) {
+        show_module();
+    }
+
     bt_info("exit: 正在恢复 hook 并等待活跃调用退出\n");
     bt_binder_hooks_remove();
     bt_protocol_cleanup();

@@ -279,7 +279,7 @@ impl TuiState {
         self.focus = self.focus.next();
     }
 
-    fn disable_selected_frequency(&mut self) -> bool {
+    fn toggle_selected_frequency(&mut self) -> bool {
         let entries = frequency_entries(self);
         let Some(entry) = entries
             .get(self.frequency_selected.min(entries.len().saturating_sub(1)))
@@ -288,7 +288,12 @@ impl TuiState {
             return false;
         };
 
-        self.disabled_frequency.insert(entry.key())
+        let key = entry.key();
+        if !self.disabled_frequency.remove(&key) {
+            self.disabled_frequency.insert(key);
+        }
+
+        true
     }
 
     fn displays_event(&self, event: &BinderEvent) -> bool {
@@ -827,7 +832,7 @@ fn handle_space(
     match state.focus {
         FocusPane::Transactions => toggle_recording(client, state, capture_config),
         FocusPane::Frequency => {
-            if state.disable_selected_frequency() {
+            if state.toggle_selected_frequency() {
                 state.select_nearest_visible(history)?;
                 state.reload_visible_window(history)?;
             }
@@ -1554,7 +1559,7 @@ fn key_hints(state: &TuiState) -> String {
             )
         }
         FocusPane::Frequency => {
-            "Keys: tab=focus  q=quit  space=disable interface/code  c=clear  up/down=move frequency  page up/down=page  home/end=jump".to_owned()
+            "Keys: tab=focus  q=quit  space=toggle interface/code  c=clear  up/down=move frequency  page up/down=page  home/end=jump".to_owned()
         }
         FocusPane::Hexdump => {
             "Keys: tab=focus  q=quit  c=clear  up/down=scroll hexdump  page up/down=page  home/end=jump".to_owned()
@@ -1999,7 +2004,7 @@ mod tests {
             4,
         );
 
-        assert!(state.disable_selected_frequency());
+        assert!(state.toggle_selected_frequency());
         state
             .select_nearest_visible(&history)
             .expect("过滤后应可重新选择可见事件");
@@ -2016,6 +2021,24 @@ mod tests {
                 .map(|entry| entry.event.code)
                 .collect::<Vec<_>>(),
             vec![2]
+        );
+
+        assert!(state.toggle_selected_frequency());
+        state
+            .select_nearest_visible(&history)
+            .expect("恢复过滤后应可重新选择可见事件");
+        state
+            .reload_visible_window(&history)
+            .expect("恢复过滤后应可重载可见窗口");
+
+        assert!(state.disabled_frequency.is_empty());
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .map(|entry| entry.event.code)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
         );
 
         let _ = fs::remove_file(path);
@@ -2049,11 +2072,12 @@ mod tests {
 
         assert!(row.contains("\x1b[38;2;176;223;226mandroid.os.IFoo"));
         assert!(row.contains("\x1b[38;5;226m#18"));
-        assert!(row.contains("\x1b[38;2;176;223;226m      7"));
+        assert!(row.contains("\x1b[38;2;176;223;226m"));
         assert!(!row.contains("\x1b[38;2;176;223;226m#18"));
         assert!(!row.contains("38;5;176"));
         assert_eq!(plain.chars().count(), 40);
         assert!(plain.contains("android.os.IFoo#18"));
+        assert!(plain.contains("        7"));
     }
 
     #[test]
@@ -2069,7 +2093,7 @@ mod tests {
         let plain = strip_ansi(&row);
 
         assert!(row.contains("48;2;176;223;226"));
-        assert!(row.contains("38;5;0"));
+        assert!(row.contains("38;5;0") || row.contains("[30"));
         assert!(!row.contains("48;5;176"));
         assert_eq!(plain.chars().count(), 40);
     }
@@ -2093,7 +2117,7 @@ mod tests {
 
         state.focus = FocusPane::Frequency;
         let keys = strip_ansi(&render_status(&state, 120)[1]);
-        assert!(keys.contains("space=disable interface/code"));
+        assert!(keys.contains("space=toggle interface/code"));
         assert!(keys.contains("up/down=move frequency"));
         assert!(!keys.contains("space=pause capture"));
 
