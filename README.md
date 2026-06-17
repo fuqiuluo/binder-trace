@@ -210,6 +210,16 @@ kernel/scripts/insmod_ko.sh bt-kmod.ko
 
 感谢 [foundryzero/binder-trace](https://github.com/foundryzero/binder-trace) 项目。
 
+## 开源协议
+
+项目采用分区协议:
+
+- 用户态 Rust crate、`xtask`、Android 辅助脚本、文档和其他非内核代码: `MIT OR Apache-2.0`。
+- `kernel/` 下的 Android/Linux 内核模块: `GPL-2.0-only`。
+- 用户态需要包含的 UAPI 头文件以文件内 SPDX 为准，例如 `kernel/src/ipc/bt_ipc_uapi.h`: `(GPL-2.0-only WITH Linux-syscall-note) OR MIT`。
+
+完整说明见根目录 [`LICENSE`](LICENSE)。
+
 ## 开发规范
 
 项目文档和代码要求见 [`docs/development-guidelines.md`](docs/development-guidelines.md)。

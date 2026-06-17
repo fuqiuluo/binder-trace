@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef BINDER_TRACE_KMOD_EVENT_H
 #define BINDER_TRACE_KMOD_EVENT_H
 

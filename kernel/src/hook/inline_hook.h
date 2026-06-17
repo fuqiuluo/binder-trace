@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /**
  * @file inline_hook.h
  * @brief ARM64 inline hook 框架，用于运行时拦截内核函数。

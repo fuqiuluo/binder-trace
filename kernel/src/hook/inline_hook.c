@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "inline_hook.h"
 #include "hijack_arm64.h"
 #include "linux/compiler_attributes.h"

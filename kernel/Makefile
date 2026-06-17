@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 obj-m := bt-kmod.o
 
 bt-kmod-y := \

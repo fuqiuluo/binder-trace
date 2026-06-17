@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 set -euo pipefail
 
 remote_dir="${BINDER_TRACE_REMOTE_DIR:-/data/local/tmp/binder-trace}"

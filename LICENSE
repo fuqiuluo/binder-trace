@@ -1,0 +1,18 @@
+# binder-trace licensing
+
+This repository uses multiple licenses:
+
+- User-space Rust crates, `xtask`, Android helper scripts, documentation, and
+  other non-kernel code are licensed under either the MIT License or the Apache
+  License 2.0, at your option.
+- The Android/Linux kernel module under `kernel/` is licensed under the GNU
+  General Public License version 2 only.
+- Kernel/user-space UAPI headers may carry a more specific SPDX identifier.
+  `kernel/src/ipc/bt_ipc_uapi.h` is licensed under
+  `(GPL-2.0-only WITH Linux-syscall-note) OR MIT`.
+- Third-party code, data, and dependencies retain their own licenses.
+
+See `LICENSE-MIT`, `LICENSE-APACHE`, `LICENSE-GPL-2.0-only`, and
+`LICENSE-Linux-syscall-note` for the full license and exception texts. Source
+files may include SPDX identifiers that make the applicable license explicit for
+that file.

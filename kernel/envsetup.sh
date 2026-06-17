@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
 
 export DDK_ROOT=${DDK_ROOT:-/opt/ddk}
 export CROSS_COMPILE=${CROSS_COMPILE:-aarch64-linux-gnu-}

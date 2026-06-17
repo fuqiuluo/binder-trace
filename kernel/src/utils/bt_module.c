@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "bt_utils.h"
 
 #include "bt_common.h"

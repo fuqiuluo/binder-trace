@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "hijack_arm64.h"
 
 #include "bt_common.h"

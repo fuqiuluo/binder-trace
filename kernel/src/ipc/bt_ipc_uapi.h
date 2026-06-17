@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: (GPL-2.0-only WITH Linux-syscall-note) OR MIT */
 #ifndef BINDER_TRACE_KMOD_IPC_UAPI_H
 #define BINDER_TRACE_KMOD_IPC_UAPI_H
 
