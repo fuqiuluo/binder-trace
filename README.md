@@ -50,7 +50,7 @@ adb shell chmod 755 /data/local/tmp/binder-trace/binder-trace
 adb shell su -c 'insmod /data/local/tmp/binder-trace/bt-kmod.ko'
 ```
 
-如果设备上已经加载过旧模块，替换前先重启设备，再重新执行 `insmod`。当前模块不支持安全热卸载。
+如果设备上已经加载过旧模块，可以先执行 `adb shell su -c 'rmmod bt_kmod'` 再重新 `insmod`。卸载时会等待已经进入 Binder hook 的调用退出；如果设备上有长时间阻塞的 Binder read/looper 线程，`rmmod` 可能等待较久。
 
 确认模块加载成功:
 
@@ -164,7 +164,7 @@ kernel/scripts/build-ddk.sh clean android14-6.1
 kernel/scripts/insmod_ko.sh bt-kmod.ko
 ```
 
-当前内核模块安装 Binder hook 后会禁止普通 `rmmod` 热卸载。原因是 `binder_ioctl` 可能长时间阻塞；在 hook 改为 tail-call 形式前，热卸载可能让阻塞线程返回到已卸载的模块文本段。需要替换模块时先重启测试设备。
+当前内核模块支持使用 `rmmod bt_kmod` 卸载。卸载时模块会先设置 draining 标记，停止新采集，恢复 Binder hook 入口，然后等待已经进入 hook 的调用退出，最后释放 trampoline 和控制面资源。因为 `binder_ioctl()` 可能在 Binder read/looper 路径里长时间阻塞，所以 `rmmod` 可能等待较久；这是为了避免卸载后返回到已经释放的模块代码。
 
 ## 输出格式
 
