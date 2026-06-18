@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Duration;
@@ -18,6 +19,7 @@ use bt_agent::{
     SocketIpcError,
 };
 use bt_decoder::{AndroidPlatformMethodsPathError, set_android_platform_methods_tsv_path};
+use bt_webui::{WebuiError, WebuiServerConfig};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -90,6 +92,7 @@ impl Cli {
         match command {
             Some(Command::Ipc(args)) => args.command.run(),
             Some(Command::Tui(args)) => args.run(),
+            Some(Command::Webui(args)) => args.run(),
             None => {
                 let config = Self::agent_config(output, device_id);
                 Agent::new(config).run().map_err(CliError::Agent)
@@ -115,6 +118,29 @@ enum Command {
     Ipc(IpcCommand),
     #[command(about = "启动实时 Binder transaction 跟踪 TUI")]
     Tui(TuiCommand),
+    #[command(about = "启动内嵌 Binder Trace WebUI")]
+    Webui(WebuiCommand),
+}
+
+#[derive(Debug, Args)]
+struct WebuiCommand {
+    #[arg(
+        long,
+        default_value = "127.0.0.1:5173",
+        value_name = "addr",
+        help = "WebUI 监听地址"
+    )]
+    listen: SocketAddr,
+}
+
+impl WebuiCommand {
+    fn run(self) -> Result<(), CliError> {
+        let config = WebuiServerConfig {
+            listen: self.listen,
+        };
+        println!("Binder Trace WebUI listening on {config}");
+        bt_webui::serve_blocking(config).map_err(CliError::Webui)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -272,6 +298,7 @@ enum CliError {
     SocketIpc(SocketIpcError),
     Io(io::Error),
     Tui(tui::TuiError),
+    Webui(WebuiError),
     PlatformMethods(AndroidPlatformMethodsPathError),
     EventStreamUnsupported,
 }
@@ -283,6 +310,7 @@ impl fmt::Display for CliError {
             Self::SocketIpc(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Tui(error) => write!(f, "{error}"),
+            Self::Webui(error) => write!(f, "{error}"),
             Self::PlatformMethods(error) => write!(f, "{error}"),
             Self::EventStreamUnsupported => {
                 write!(
@@ -453,6 +481,20 @@ mod tests {
         );
         assert_eq!(tui.tgid, Some(123));
         assert_eq!(tui.uid, Some(2000));
+    }
+
+    #[test]
+    fn parses_webui_listen_addr() {
+        let cli = Cli::try_parse_from(["binder-trace", "webui", "--listen", "127.0.0.1:9080"])
+            .expect("webui 子命令应可解析");
+
+        let Some(Command::Webui(webui)) = cli.command else {
+            panic!("expected webui command");
+        };
+        assert_eq!(
+            webui.listen,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 9080))
+        );
     }
 
     #[test]

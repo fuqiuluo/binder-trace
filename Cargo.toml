@@ -6,6 +6,7 @@ members = [
     "crates/bt-decoder",
     "crates/bt-storage",
     "crates/bt-cli",
+    "crates/bt-webui",
 ]
 resolver = "3"
 

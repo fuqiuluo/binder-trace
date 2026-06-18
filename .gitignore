@@ -1,11 +1,12 @@
+# Compiled object files
 /target
 /.idea
-/.claude
 /.vscode
 /.DS_Store
 *.log
-/.agent
 /.cache
+
+# Kernel build artifacts
 /kernel/*.ko
 /kernel/*.mod
 /kernel/*.mod.c
@@ -20,3 +21,13 @@
 /kernel/**/*.cmd
 /kernel/**/.*.cmd
 /kernel/compile_commands.json
+/.codex/
+
+# AI
+AGENTS.md
+/.claude
+/.agent
+
+# WebUI build artifacts
+crates/bt-webui/dist/*
+crates/bt-webui/node_modules/*

@@ -1,0 +1,15 @@
+[package]
+name = "bt-webui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "bt_webui"
+path = "rust/lib.rs"
+
+[dependencies]
+axum = "0.8.9"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
