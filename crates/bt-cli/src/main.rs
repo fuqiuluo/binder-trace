@@ -21,6 +21,7 @@ use bt_decoder::{AndroidPlatformMethodsPathError, set_android_platform_methods_t
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod startup_marker;
 mod tui;
 mod tui_history;
 
@@ -77,6 +78,13 @@ impl Cli {
 
         if let Some(path) = platform_methods_tsv {
             set_android_platform_methods_tsv_path(path)?;
+        }
+
+        if let Err(error) = startup_marker::write_default() {
+            eprintln!(
+                "warning: failed to write startup marker {}: {error}",
+                startup_marker::DEFAULT_MARKER_PATH
+            );
         }
 
         match command {

@@ -60,6 +60,8 @@ adb shell su -c "dmesg | grep -i 'binder-trace\|bt_kmod' | tail -30"
 adb shell su -c '/data/local/tmp/binder-trace/binder-trace ipc feature'
 ```
 
+`binder-trace` 进入真实运行路径时会 best-effort 写入启动检测点 `/data/local/tmp/.fuqiuluo`。这个文件用于合规 App 判断审计工具是否运行过，不作为隐藏驻留或反篡改机制；`--help`、参数解析失败等未进入运行路径的情况不会写入。
+
 启动 TUI 建议进入交互 shell，避免非交互 `adb shell su -c` 影响终端按键和尺寸:
 
 ```bash
