@@ -6,7 +6,7 @@
 
 | WebUI                                                                                  | TUI                                                                                |
 |----------------------------------------------------------------------------------------|------------------------------------------------------------------------------------|
-| [![binder-trace WebUI 演示](docs/assets/webui-demo-thumb.png)](docs/assets/webui-demo.png) | [![binder-trace TUI 演示](docs/assets/tui-demo-thumb.png)](docs/assets/tui-demo.png) |
+| [![binder-trace WebUI 演示](https://github.com/fuqiuluo/binder-trace/raw/master/docs/assets/webui-demo-thumb.png)](https://github.com/fuqiuluo/binder-trace/raw/master/docs/assets/webui-demo.png) | [![binder-trace TUI 演示](https://github.com/fuqiuluo/binder-trace/raw/master/docs/assets/tui-demo-thumb.png)](https://github.com/fuqiuluo/binder-trace/raw/master/docs/assets/tui-demo.png) |
 
 ## 功能
 
