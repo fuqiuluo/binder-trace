@@ -191,6 +191,9 @@ name = "bt-webui"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bt-agent",
+ "bt-decoder",
+ "serde",
  "thiserror",
  "tokio",
 ]

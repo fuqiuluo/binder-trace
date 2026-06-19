@@ -14,17 +14,23 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use axum::{
-    Router,
+    Json, Router,
     body::{Body, Bytes},
+    extract::{Query, State},
     http::{
         Method, StatusCode, Uri,
         header::{ALLOW, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE},
         response::Builder as ResponseBuilder,
     },
     response::{IntoResponse, Response},
+    routing::{get, post},
 };
+pub use events::WebuiEventsConfig;
+use events::{EventsQuery, EventsResponse, WebuiEventHub};
 use thiserror::Error;
 use tokio::{net::TcpListener, runtime};
+
+mod events;
 
 #[derive(Clone, Copy, Debug)]
 struct EmbeddedAsset {
@@ -40,12 +46,15 @@ include!(concat!(env!("OUT_DIR"), "/webui_assets.rs"));
 pub struct WebuiServerConfig {
     /// 监听地址。默认绑定 `127.0.0.1`，避免调试页面意外暴露到局域网。
     pub listen: SocketAddr,
+    /// 生产事件源配置。
+    pub events: WebuiEventsConfig,
 }
 
 impl Default for WebuiServerConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 5173)),
+            events: WebuiEventsConfig::default(),
         }
     }
 }
@@ -90,7 +99,7 @@ pub fn embedded_asset_count() -> usize {
 /// `WebuiError::MissingIndex`。
 pub async fn serve(config: WebuiServerConfig) -> Result<(), WebuiError> {
     let listener = TcpListener::bind(config.listen).await?;
-    serve_listener(listener).await
+    serve_listener(listener, config).await
 }
 
 /// 启动一个阻塞式 HTTP server，用于提供内嵌 WebUI。
@@ -112,9 +121,12 @@ pub fn serve_blocking(config: WebuiServerConfig) -> Result<(), WebuiError> {
     runtime.block_on(serve(config))
 }
 
-async fn serve_listener(listener: TcpListener) -> Result<(), WebuiError> {
+async fn serve_listener(
+    listener: TcpListener,
+    config: WebuiServerConfig,
+) -> Result<(), WebuiError> {
     ensure_index_asset()?;
-    axum::serve(listener, webui_router()).await?;
+    axum::serve(listener, webui_router(config.events)).await?;
     Ok(())
 }
 
@@ -126,8 +138,25 @@ fn ensure_index_asset() -> Result<(), WebuiError> {
     }
 }
 
-fn webui_router() -> Router {
-    Router::new().fallback(asset_handler)
+fn webui_router(events_config: WebuiEventsConfig) -> Router {
+    let events = WebuiEventHub::new(events_config);
+    Router::new()
+        .route("/api/events", get(events_handler))
+        .route("/api/events/clear", post(clear_events_handler))
+        .fallback(asset_handler)
+        .with_state(events)
+}
+
+async fn events_handler(
+    State(events): State<WebuiEventHub>,
+    Query(query): Query<EventsQuery>,
+) -> Json<EventsResponse> {
+    Json(events.snapshot(&query))
+}
+
+async fn clear_events_handler(State(events): State<WebuiEventHub>) -> StatusCode {
+    events.clear();
+    StatusCode::NO_CONTENT
 }
 
 async fn asset_handler(method: Method, uri: Uri) -> Response {
@@ -242,7 +271,10 @@ mod tests {
         time::timeout,
     };
 
-    use super::{asset_for_request_path, asset_handler, embedded_asset_count, serve_listener};
+    use super::{
+        WebuiServerConfig, asset_for_request_path, asset_handler, embedded_asset_count,
+        serve_listener,
+    };
 
     #[test]
     fn embeds_dist_assets() {
@@ -290,7 +322,7 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("test server should have address");
-        let server = tokio::spawn(serve_listener(listener));
+        let server = tokio::spawn(serve_listener(listener, WebuiServerConfig::default()));
         let slow_connection = TcpStream::connect(address)
             .await
             .expect("slow client should connect");
@@ -330,7 +362,7 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("test server should have address");
-        let server = tokio::spawn(serve_listener(listener));
+        let server = tokio::spawn(serve_listener(listener, WebuiServerConfig::default()));
 
         let mut connection = TcpStream::connect(address)
             .await

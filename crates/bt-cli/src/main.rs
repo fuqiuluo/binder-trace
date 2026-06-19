@@ -19,7 +19,7 @@ use bt_agent::{
     SocketIpcError,
 };
 use bt_decoder::{AndroidPlatformMethodsPathError, set_android_platform_methods_tsv_path};
-use bt_webui::{WebuiError, WebuiServerConfig};
+use bt_webui::{WebuiError, WebuiEventsConfig, WebuiServerConfig};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -131,15 +131,58 @@ struct WebuiCommand {
         help = "WebUI 监听地址"
     )]
     listen: SocketAddr,
+
+    #[arg(long, value_name = "tgid", help = "只捕获指定进程组")]
+    tgid: Option<i32>,
+
+    #[arg(long, value_name = "pid", help = "只捕获指定线程")]
+    pid: Option<i32>,
+
+    #[arg(long, value_name = "uid", help = "只捕获指定 uid")]
+    uid: Option<u32>,
+
+    #[arg(long, help = "只读事件流，不自动更新内核捕获配置")]
+    no_enable: bool,
+
+    #[arg(
+        long,
+        value_name = "sdk",
+        help = "Android SDK 版本；未指定时尝试读取 ro.build.version.sdk"
+    )]
+    android_sdk: Option<u16>,
 }
 
 impl WebuiCommand {
     fn run(self) -> Result<(), CliError> {
+        let capture_config = self.capture_config();
         let config = WebuiServerConfig {
             listen: self.listen,
+            events: WebuiEventsConfig {
+                enabled: true,
+                capture_config: (!self.no_enable).then_some(capture_config),
+                android_sdk: self.android_sdk.or_else(detect_android_sdk),
+                ..WebuiEventsConfig::default()
+            },
         };
         println!("Binder Trace WebUI listening on {config}");
         bt_webui::serve_blocking(config).map_err(CliError::Webui)
+    }
+
+    fn capture_config(&self) -> CaptureConfig {
+        let mut config = CaptureConfig::binder_transaction_enabled();
+
+        if let Some(tgid) = self.tgid {
+            config.tgid = tgid;
+        }
+        if let Some(pid) = self.pid {
+            config.pid = pid;
+        }
+        if let Some(uid) = self.uid {
+            config.uid = uid;
+            config.uid_enabled = 1;
+        }
+
+        config
     }
 }
 

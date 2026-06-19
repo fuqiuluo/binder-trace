@@ -11,5 +11,8 @@ path = "rust/lib.rs"
 
 [dependencies]
 axum = "0.8.9"
+bt-agent = { path = "../bt-agent" }
+bt-decoder = { path = "../bt-decoder" }
+serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
