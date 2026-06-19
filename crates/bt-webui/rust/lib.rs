@@ -42,7 +42,7 @@ struct EmbeddedAsset {
 include!(concat!(env!("OUT_DIR"), "/webui_assets.rs"));
 
 /// WebUI 静态资源服务器配置。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WebuiServerConfig {
     /// 监听地址。默认绑定 `127.0.0.1`，避免调试页面意外暴露到局域网。
     pub listen: SocketAddr,

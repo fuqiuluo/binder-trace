@@ -8,6 +8,7 @@
 //! - 外部调用者只通过这里 re-export 的类型组合 agent，不直接依赖内部模块布局。
 
 mod agent;
+mod capture_history;
 mod config;
 mod device;
 mod diagnostic;
@@ -15,6 +16,7 @@ mod error;
 mod socket_ipc;
 
 pub use agent::Agent;
+pub use capture_history::{CaptureHistory, HistoryError};
 pub use config::{AgentConfig, OutputConfig};
 pub use error::AgentError;
 pub use socket_ipc::{

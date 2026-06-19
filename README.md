@@ -94,13 +94,16 @@ http://127.0.0.1:5173/
 ./binder-trace webui --pid 12345
 ./binder-trace webui --no-enable
 ./binder-trace webui --android-sdk 35
+./binder-trace webui --history-path /data/local/tmp/binder-trace/webui-events.btcap
+./binder-trace webui --max-history-bytes 8589934592
 ```
 
 说明:
 
 - 默认会启用 Binder transaction 捕获配置。
 - `--no-enable` 只读取现有事件流，不修改内核捕获配置。
-- WebUI 的过滤和分页在后端执行，浏览器只渲染当前窗口。
+- WebUI 事件会写入共享 `CaptureHistory` btcap 后端，默认文件为 `/data/local/tmp/binder-trace/webui-events.btcap`，默认最多累计使用 8GiB 文件空间。
+- WebUI 的过滤和分页在后端执行，浏览器只渲染当前窗口；后端不会因为浏览器窗口大小丢弃已捕获事件。
 - 右下角可以切换当前渲染窗口大小: `256`、`1024`、`4096`。
 
 ## 使用 TUI
@@ -131,6 +134,72 @@ TUI 默认历史文件:
 - 其他环境: `binder-trace.btcap`
 
 界面语言会根据 Android locale 或 `LANG` / `LC_*` 环境变量选择。目前内置 English、中文、日本語。
+
+## 使用 MCP
+
+MCP 入口适合让 AI assistant 在线查询 Binder trace。它以 Streamable HTTP 方式提供 `/mcp` endpoint，默认只读取实时事件流，不修改内核捕获配置。
+
+先转发端口:
+
+```bash
+adb forward tcp:5174 tcp:5174
+```
+
+在设备上启动 MCP 服务:
+
+```bash
+adb shell
+su
+cd /data/local/tmp/binder-trace
+./binder-trace mcp --listen 127.0.0.1:5174
+```
+
+如果需要允许 AI 开关 Binder trace，启动时显式打开控制权限:
+
+```bash
+./binder-trace mcp --listen 127.0.0.1:5174 --allow-control
+```
+
+也可以在 MCP 服务启动时立即开启捕获:
+
+```bash
+./binder-trace mcp --listen 127.0.0.1:5174 --allow-control --enable --uid 1000
+```
+
+如需指定 MCP 历史文件、初始容量或文件上限:
+
+```bash
+./binder-trace mcp --history-path /data/local/tmp/binder-trace/custom-mcp.btcap --rows 65536
+./binder-trace mcp --max-history-bytes 8589934592
+```
+
+MCP 历史默认写入 `/data/local/tmp/binder-trace/mcp-events.btcap`，默认最多累计使用 8GiB 文件空间；达到上限后会拒绝继续写入，并 best-effort 关闭内核捕获，避免异常流量持续打满审计服务。
+
+通过桌面 MCP client 使用时，连接本机转发后的 HTTP 地址。不同 client 的字段名略有差异，核心是使用 Streamable HTTP，并把 URL 指向 `/mcp`:
+
+```json
+{
+  "mcpServers": {
+    "binder-trace": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:5174/mcp"
+    }
+  }
+}
+```
+
+这种方式不会在 MCP host 启动时自动通过 `adb shell` 拉起 `binder-trace`；只有你手动启动设备侧服务后，client 才能连接。
+
+当前 MCP tools:
+
+- `binder_trace_status`: 查看驱动特征、捕获配置、统计和 btcap 历史状态。
+- `binder_trace_enable`: 开启 Binder transaction 捕获，可传 `tgid`、`pid`、`uid`、`min_size`、`max_size`。
+- `binder_trace_disable`: 关闭内核捕获。
+- `binder_trace_clear_stats`: 清空内核统计。
+- `binder_trace_events`: 查询事件，支持方向、接口、文本、`after_seq`/`before_seq` 分页，以及 `since_ns`/`until_ns` 时间窗口过滤。
+- `binder_trace_event`: 按 sequence 查询单条事件。
+- `binder_trace_top_interfaces`: 统计当前 btcap 历史内最活跃的 Binder interface。
+- `binder_trace_clear_history`: 清空 MCP btcap 历史，不修改内核状态。
 
 ## 输出 JSONL
 

@@ -15,17 +15,17 @@ use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Duration;
 
 use bt_agent::{
-    Agent, AgentConfig, AgentError, CaptureConfig, DriverFeature, OutputConfig, SocketIpcClient,
-    SocketIpcError,
+    Agent, AgentConfig, AgentError, CaptureConfig, CaptureHistory, DriverFeature, OutputConfig,
+    SocketIpcClient, SocketIpcError,
 };
 use bt_decoder::{AndroidPlatformMethodsPathError, set_android_platform_methods_tsv_path};
+use bt_mcp::{McpServerConfig, McpServerError};
 use bt_webui::{WebuiError, WebuiEventsConfig, WebuiServerConfig};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod startup_marker;
 mod tui;
-mod tui_history;
 
 fn main() -> ExitCode {
     init_tracing();
@@ -93,6 +93,7 @@ impl Cli {
             Some(Command::Ipc(args)) => args.command.run(),
             Some(Command::Tui(args)) => args.run(),
             Some(Command::Webui(args)) => args.run(),
+            Some(Command::Mcp(args)) => args.run(),
             None => {
                 let config = Self::agent_config(output, device_id);
                 Agent::new(config).run().map_err(CliError::Agent)
@@ -120,6 +121,119 @@ enum Command {
     Tui(TuiCommand),
     #[command(about = "启动内嵌 Binder Trace WebUI")]
     Webui(WebuiCommand),
+    #[command(about = "启动在线 Binder Trace MCP Streamable HTTP 服务")]
+    Mcp(McpCommand),
+}
+
+#[derive(Debug, Args)]
+struct McpCommand {
+    #[arg(
+        long,
+        default_value = "127.0.0.1:5174",
+        value_name = "addr",
+        help = "MCP HTTP 监听地址"
+    )]
+    listen: SocketAddr,
+
+    #[arg(
+        long,
+        default_value_t = 65536,
+        help = "btcap 历史文件初始事件容量，满后自动扩容"
+    )]
+    rows: usize,
+
+    #[arg(
+        long,
+        value_name = "path",
+        help = "MCP btcap 历史文件路径，默认使用 /data/local/tmp/binder-trace/mcp-events.btcap"
+    )]
+    history_path: Option<PathBuf>,
+
+    #[arg(
+        long,
+        default_value_t = CaptureHistory::DEFAULT_MAX_FILE_BYTES,
+        value_name = "bytes",
+        help = "MCP btcap 历史文件最大字节数，默认 8GiB"
+    )]
+    max_history_bytes: u64,
+
+    #[arg(long, help = "允许 MCP tool 修改内核捕获配置")]
+    allow_control: bool,
+
+    #[arg(long, help = "MCP 服务启动时立即开启 Binder transaction 捕获")]
+    enable: bool,
+
+    #[arg(long, value_name = "tgid", help = "开启捕获时只捕获指定进程组")]
+    tgid: Option<i32>,
+
+    #[arg(long, value_name = "pid", help = "开启捕获时只捕获指定线程")]
+    pid: Option<i32>,
+
+    #[arg(long, value_name = "uid", help = "开启捕获时只捕获指定 uid")]
+    uid: Option<u32>,
+
+    #[arg(
+        long,
+        value_name = "bytes",
+        help = "开启捕获时只捕获大于等于该 data size 的事件"
+    )]
+    min_size: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "bytes",
+        help = "开启捕获时只捕获小于等于该 data size 的事件"
+    )]
+    max_size: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "sdk",
+        help = "Android SDK 版本；未指定时尝试读取 ro.build.version.sdk"
+    )]
+    android_sdk: Option<u16>,
+}
+
+impl McpCommand {
+    fn run(self) -> Result<(), CliError> {
+        let capture_config = self.capture_config();
+        let android_sdk = self.android_sdk.or_else(detect_android_sdk);
+        let config = McpServerConfig {
+            listen: self.listen,
+            initial_events: self.rows,
+            history_path: self.history_path,
+            max_history_bytes: self.max_history_bytes,
+            allow_control: self.allow_control,
+            auto_enable: self.enable,
+            capture_config,
+            android_sdk,
+        };
+        eprintln!("Binder Trace MCP listening on http://{}/mcp", config.listen);
+        bt_mcp::serve_http_blocking(config).map_err(CliError::Mcp)
+    }
+
+    fn capture_config(&self) -> CaptureConfig {
+        let mut config = CaptureConfig::binder_transaction_enabled();
+
+        if let Some(tgid) = self.tgid {
+            config.tgid = tgid;
+        }
+        if let Some(pid) = self.pid {
+            config.pid = pid;
+        }
+        if let Some(uid) = self.uid {
+            config.uid = uid;
+            config.uid_enabled = 1;
+        }
+        if let Some(min_size) = self.min_size {
+            config.min_size = min_size;
+        }
+        if let Some(max_size) = self.max_size {
+            config.max_size = max_size;
+        }
+
+        config
+    }
 }
 
 #[derive(Debug, Args)]
@@ -131,6 +245,28 @@ struct WebuiCommand {
         help = "WebUI 监听地址"
     )]
     listen: SocketAddr,
+
+    #[arg(
+        long,
+        default_value_t = 65536,
+        help = "WebUI btcap 历史文件初始事件容量，满后自动扩容"
+    )]
+    rows: usize,
+
+    #[arg(
+        long,
+        value_name = "path",
+        help = "WebUI btcap 历史文件路径，默认使用 /data/local/tmp/binder-trace/webui-events.btcap"
+    )]
+    history_path: Option<PathBuf>,
+
+    #[arg(
+        long,
+        default_value_t = CaptureHistory::DEFAULT_MAX_FILE_BYTES,
+        value_name = "bytes",
+        help = "WebUI btcap 历史文件最大字节数，默认 8GiB"
+    )]
+    max_history_bytes: u64,
 
     #[arg(long, value_name = "tgid", help = "只捕获指定进程组")]
     tgid: Option<i32>,
@@ -161,6 +297,9 @@ impl WebuiCommand {
                 enabled: true,
                 capture_config: (!self.no_enable).then_some(capture_config),
                 android_sdk: self.android_sdk.or_else(detect_android_sdk),
+                max_events: self.rows,
+                history_path: self.history_path,
+                max_history_bytes: self.max_history_bytes,
                 ..WebuiEventsConfig::default()
             },
         };
@@ -342,6 +481,7 @@ enum CliError {
     Io(io::Error),
     Tui(tui::TuiError),
     Webui(WebuiError),
+    Mcp(McpServerError),
     PlatformMethods(AndroidPlatformMethodsPathError),
     EventStreamUnsupported,
 }
@@ -354,6 +494,7 @@ impl fmt::Display for CliError {
             Self::Io(error) => write!(f, "{error}"),
             Self::Tui(error) => write!(f, "{error}"),
             Self::Webui(error) => write!(f, "{error}"),
+            Self::Mcp(error) => write!(f, "{error}"),
             Self::PlatformMethods(error) => write!(f, "{error}"),
             Self::EventStreamUnsupported => {
                 write!(
@@ -528,8 +669,19 @@ mod tests {
 
     #[test]
     fn parses_webui_listen_addr() {
-        let cli = Cli::try_parse_from(["binder-trace", "webui", "--listen", "127.0.0.1:9080"])
-            .expect("webui 子命令应可解析");
+        let cli = Cli::try_parse_from([
+            "binder-trace",
+            "webui",
+            "--listen",
+            "127.0.0.1:9080",
+            "--history-path",
+            "/data/local/tmp/binder-trace/test-webui.btcap",
+            "--max-history-bytes",
+            "1048576",
+            "--rows",
+            "128",
+        ])
+        .expect("webui 子命令应可解析");
 
         let Some(Command::Webui(webui)) = cli.command else {
             panic!("expected webui command");
@@ -538,6 +690,65 @@ mod tests {
             webui.listen,
             std::net::SocketAddr::from(([127, 0, 0, 1], 9080))
         );
+        assert_eq!(
+            webui.history_path.as_deref(),
+            Some(std::path::Path::new(
+                "/data/local/tmp/binder-trace/test-webui.btcap"
+            ))
+        );
+        assert_eq!(webui.rows, 128);
+        assert_eq!(webui.max_history_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn parses_mcp_control_filters() {
+        let cli = Cli::try_parse_from([
+            "binder-trace",
+            "mcp",
+            "--listen",
+            "127.0.0.1:9000",
+            "--history-path",
+            "/data/local/tmp/binder-trace/test-mcp.btcap",
+            "--max-history-bytes",
+            "1048576",
+            "--rows",
+            "128",
+            "--allow-control",
+            "--enable",
+            "--tgid",
+            "123",
+            "--uid",
+            "2000",
+            "--min-size",
+            "16",
+            "--max-size",
+            "4096",
+        ])
+        .expect("mcp 子命令应可解析");
+
+        let Some(Command::Mcp(mcp)) = cli.command else {
+            panic!("expected mcp command");
+        };
+        let config = mcp.capture_config();
+        assert_eq!(
+            mcp.listen,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 9000))
+        );
+        assert_eq!(
+            mcp.history_path.as_deref(),
+            Some(std::path::Path::new(
+                "/data/local/tmp/binder-trace/test-mcp.btcap"
+            ))
+        );
+        assert_eq!(mcp.rows, 128);
+        assert_eq!(mcp.max_history_bytes, 1_048_576);
+        assert!(mcp.allow_control);
+        assert!(mcp.enable);
+        assert_eq!(config.tgid, 123);
+        assert_eq!(config.uid, 2000);
+        assert_eq!(config.uid_enabled, 1);
+        assert_eq!(config.min_size, 16);
+        assert_eq!(config.max_size, 4096);
     }
 
     #[test]

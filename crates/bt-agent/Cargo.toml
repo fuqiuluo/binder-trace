@@ -12,6 +12,7 @@ bt-common = { path = "../bt-common" }
 bt-decoder = { path = "../bt-decoder" }
 bt-storage = { path = "../bt-storage" }
 libc = "0.2.186"
+memmap2 = "0.9.10"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 zerocopy = { version = "0.8.52", features = ["derive"] }

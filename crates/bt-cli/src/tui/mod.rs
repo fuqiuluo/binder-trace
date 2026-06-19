@@ -12,15 +12,16 @@ use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use bt_agent::{BinderEvent, CaptureConfig, CaptureStats, SocketIpcClient, SocketIpcError};
+use bt_agent::{
+    BinderEvent, CaptureConfig, CaptureHistory, CaptureStats, HistoryError, SocketIpcClient,
+    SocketIpcError,
+};
 use bt_decoder::{AndroidPlatformMethods, parse_interface_token};
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
 use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{self, MissedTickBehavior};
-
-use crate::tui_history::{CaptureHistory, HistoryError};
 
 mod i18n;
 mod input;
@@ -929,7 +930,7 @@ mod tests {
         render_panel, render_status, transaction_color_index, truncate_with_ellipsis,
         visible_window_bounds,
     };
-    use crate::tui_history::CaptureHistory;
+    use bt_agent::CaptureHistory;
 
     #[test]
     fn truncation_marks_omitted_text() {
@@ -1092,8 +1093,8 @@ mod tests {
         let mut reply = binder_event("", 0, true);
         reply.reply_to_debug_id = 77;
 
-        history.append_for_test(send).expect("send 应可追加");
-        let reply_index = history.append_for_test(reply).expect("reply 应可追加");
+        history.append_event(send).expect("send 应可追加");
+        let reply_index = history.append_event(reply).expect("reply 应可追加");
         state
             .sync_transaction_summaries(&history)
             .expect("摘要应可从历史回填");
@@ -1134,10 +1135,10 @@ mod tests {
         let mut history = CaptureHistory::create(path.clone(), 4).expect("历史文件应可创建");
         let mut state = TuiState::new(12, 16, empty_stats(), true, Some(34), path.clone());
         let hidden = history
-            .append_for_test(binder_event("android.os.IMessenger", 1, false))
+            .append_event(binder_event("android.os.IMessenger", 1, false))
             .expect("测试事件应可追加");
         let visible = history
-            .append_for_test(binder_event("android.os.IMessenger", 2, false))
+            .append_event(binder_event("android.os.IMessenger", 2, false))
             .expect("测试事件应可追加");
         state.push_event(
             hidden,
@@ -1437,7 +1438,7 @@ mod tests {
         for sequence in 0..5 {
             let mut event = binder_event("android.os.IMessenger", sequence as u32, false);
             event.sequence = sequence;
-            history.append_for_test(event).expect("测试事件应可追加");
+            history.append_event(event).expect("测试事件应可追加");
         }
 
         let mut state = TuiState::new(0, 2, empty_stats(), true, Some(34), path.clone());
@@ -1495,7 +1496,7 @@ mod tests {
         for sequence in 0..3 {
             let mut event = binder_event("android.os.IMessenger", sequence as u32, false);
             event.sequence = sequence;
-            let index = history.append_for_test(event).expect("测试事件应可追加");
+            let index = history.append_event(event).expect("测试事件应可追加");
             state.push_event(index, event);
         }
 
@@ -1515,7 +1516,7 @@ mod tests {
         for sequence in 3..5 {
             let mut event = binder_event("android.os.IMessenger", sequence as u32, false);
             event.sequence = sequence;
-            let index = history.append_for_test(event).expect("测试事件应可追加");
+            let index = history.append_event(event).expect("测试事件应可追加");
             state.push_event(index, event);
         }
 
@@ -1553,7 +1554,7 @@ mod tests {
         for sequence in 0..128 {
             let mut event = binder_event("android.os.IMessenger", 1, false);
             event.sequence = sequence;
-            let index = history.append_for_test(event).expect("测试事件应可追加");
+            let index = history.append_event(event).expect("测试事件应可追加");
             state.push_event(index, event);
         }
         state

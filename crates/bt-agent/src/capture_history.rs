@@ -1,8 +1,8 @@
-//! TUI 使用的二进制捕获历史。
+//! Binder trace 会话二进制捕获历史。
 //!
 //! # 职责
 //! - 把 socket 事件直接接收到 mmap 文件中的 `BinderEvent` 槽位。
-//! - 按固定记录大小随机读取历史窗口，支撑 TUI 向上滚动加载旧事件。
+//! - 按固定记录大小随机读取历史窗口，支撑 TUI、MCP 等前端按需加载旧事件。
 //! - 用 `zerocopy` 维护事件结构和字节视图之间的转换，避免手写裸指针解析。
 
 use std::fmt;
@@ -13,9 +13,10 @@ use std::mem::size_of;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use bt_agent::{BinderEvent, SocketIpcClient, SocketIpcError};
 use memmap2::{MmapMut, MmapOptions};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+use crate::{BinderEvent, SocketIpcClient, SocketIpcError};
 
 const MAGIC: [u8; 8] = *b"BTCEVT01";
 const FORMAT_VERSION: u32 = 1;
@@ -23,6 +24,7 @@ const EVENT_ABI_VERSION: u32 = 3;
 const HEADER_SIZE: usize = size_of::<CaptureFileHeader>();
 const EVENT_SIZE: usize = size_of::<BinderEvent>();
 const DEFAULT_INITIAL_EVENTS: u64 = 65_536;
+const DEFAULT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -57,6 +59,11 @@ impl CaptureFileHeader {
 pub enum HistoryError {
     Io(io::Error),
     Socket(SocketIpcError),
+    CapacityLimit {
+        needed_events: u64,
+        max_events: u64,
+        max_file_bytes: u64,
+    },
 }
 
 impl fmt::Display for HistoryError {
@@ -64,6 +71,14 @@ impl fmt::Display for HistoryError {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Socket(error) => write!(f, "{error}"),
+            Self::CapacityLimit {
+                needed_events,
+                max_events,
+                max_file_bytes,
+            } => write!(
+                f,
+                "btcap 历史文件达到容量上限: 需要 {needed_events} 条事件，最多 {max_events} 条事件，最大文件大小 {max_file_bytes} 字节"
+            ),
         }
     }
 }
@@ -82,7 +97,7 @@ impl From<SocketIpcError> for HistoryError {
     }
 }
 
-/// 当前 TUI 会话的全量二进制事件历史。
+/// 当前会话的全量二进制事件历史。
 pub struct CaptureHistory {
     file: File,
     mmap: MmapMut,
@@ -90,17 +105,39 @@ pub struct CaptureHistory {
     _path_lock: Option<CapturePathLock>,
     count: u64,
     capacity: u64,
+    max_events: u64,
+    max_file_bytes: u64,
 }
 
 impl CaptureHistory {
+    /// 默认 btcap 文件上限，避免异常流量把设备存储写满。
+    pub const DEFAULT_MAX_FILE_BYTES: u64 = DEFAULT_MAX_FILE_BYTES;
+
     /// 创建一个新的历史文件；同名旧文件会被当前会话覆盖。
     pub fn create(path: PathBuf, initial_events: usize) -> Result<Self, HistoryError> {
-        create_parent_dir(&path)?;
-        let capacity = (initial_events as u64).max(DEFAULT_INITIAL_EVENTS);
-        Self::create_with_capacity(path, capacity)
+        Self::create_with_max_file_bytes(path, initial_events, Self::DEFAULT_MAX_FILE_BYTES)
     }
 
-    fn create_with_capacity(path: PathBuf, capacity: u64) -> Result<Self, HistoryError> {
+    /// 使用指定文件大小上限创建新的历史文件。
+    pub fn create_with_max_file_bytes(
+        path: PathBuf,
+        initial_events: usize,
+        max_file_bytes: u64,
+    ) -> Result<Self, HistoryError> {
+        create_parent_dir(&path)?;
+        let max_events = max_event_capacity(max_file_bytes)?;
+        let capacity = (initial_events as u64)
+            .max(DEFAULT_INITIAL_EVENTS)
+            .min(max_events);
+        Self::create_with_capacity(path, capacity, max_events, max_file_bytes)
+    }
+
+    fn create_with_capacity(
+        path: PathBuf,
+        capacity: u64,
+        max_events: u64,
+        max_file_bytes: u64,
+    ) -> Result<Self, HistoryError> {
         let path_lock = CapturePathLock::prepare(&path)?;
         let file = OpenOptions::new()
             .read(true)
@@ -117,6 +154,8 @@ impl CaptureHistory {
             _path_lock: path_lock,
             count: 0,
             capacity,
+            max_events,
+            max_file_bytes,
         };
         *history.header_mut()? = CaptureFileHeader::new(capacity);
         if let Some(path_lock) = history._path_lock.as_mut() {
@@ -140,6 +179,21 @@ impl CaptureHistory {
 
     pub const fn event_count(&self) -> u64 {
         self.count
+    }
+
+    /// 返回当前文件可容纳的事件数量；满后会自动扩容。
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// 返回当前会话允许写入的最大事件数量。
+    pub const fn max_events(&self) -> u64 {
+        self.max_events
+    }
+
+    /// 返回当前会话允许使用的最大 btcap 文件字节数。
+    pub const fn max_file_bytes(&self) -> u64 {
+        self.max_file_bytes
     }
 
     /// 从 socket 读取事件，匹配后直接写入 mmap 文件中的下一个槽位。
@@ -166,6 +220,20 @@ impl CaptureHistory {
         }
     }
 
+    /// 追加一条已经从 socket 读取出的事件。
+    pub fn append_event(&mut self, event: BinderEvent) -> Result<u64, HistoryError> {
+        self.ensure_capacity(self.count + 1)?;
+        *self.event_slot_mut(self.count)? = event;
+        self.commit_event()
+    }
+
+    /// 清空当前会话历史；文件容量保留，后续事件从下标 0 重新写入。
+    pub fn clear(&mut self) -> Result<(), HistoryError> {
+        self.count = 0;
+        self.header_mut()?.count = 0;
+        Ok(())
+    }
+
     /// 从历史文件读取一个显示窗口。
     #[cfg(test)]
     pub fn load_window(&self, start: u64, limit: usize) -> Result<Vec<BinderEvent>, HistoryError> {
@@ -188,10 +256,18 @@ impl CaptureHistory {
         if needed <= self.capacity {
             return Ok(());
         }
+        if needed > self.max_events {
+            return Err(HistoryError::CapacityLimit {
+                needed_events: needed,
+                max_events: self.max_events,
+                max_file_bytes: self.max_file_bytes,
+            });
+        }
 
         let mut next_capacity = self.capacity.max(1);
         while next_capacity < needed {
-            next_capacity = next_capacity.checked_mul(2).ok_or_else(capacity_error)?;
+            next_capacity = next_capacity.saturating_mul(2);
+            next_capacity = next_capacity.min(self.max_events);
         }
 
         self.mmap.flush_async()?;
@@ -231,17 +307,26 @@ impl CaptureHistory {
             .map_err(|_| invalid_data("历史事件记录布局不合法"))
     }
 
-    #[cfg(test)]
-    pub(crate) fn append_for_test(&mut self, event: BinderEvent) -> Result<u64, HistoryError> {
-        self.ensure_capacity(self.count + 1)?;
-        *self.event_slot_mut(self.count)? = event;
-        self.commit_event()
+    /// 按历史下标顺序遍历当前会话中已经提交的事件。
+    pub fn for_each_event(
+        &self,
+        mut visit: impl FnMut(u64, BinderEvent) -> Result<(), HistoryError>,
+    ) -> Result<(), HistoryError> {
+        for index in 0..self.count {
+            let event = self.event_at(index).map_err(HistoryError::Io)?;
+            visit(index, event)?;
+        }
+
+        Ok(())
     }
 
     #[cfg(test)]
     fn create_with_capacity_for_test(path: PathBuf, capacity: u64) -> Result<Self, HistoryError> {
         create_parent_dir(&path)?;
-        Self::create_with_capacity(path, capacity.max(1))
+        let capacity = capacity.max(1);
+        let max_events = capacity.saturating_mul(8);
+        let max_file_bytes = file_len(max_events).map_err(HistoryError::Io)?;
+        Self::create_with_capacity(path, capacity, max_events, max_file_bytes)
     }
 }
 
@@ -290,6 +375,27 @@ fn file_len(capacity: u64) -> io::Result<u64> {
                 .ok_or_else(capacity_error)?,
         )
         .ok_or_else(capacity_error)
+}
+
+fn max_event_capacity(max_file_bytes: u64) -> Result<u64, HistoryError> {
+    let event_bytes = EVENT_SIZE as u64;
+    let Some(data_bytes) = max_file_bytes.checked_sub(HEADER_SIZE as u64) else {
+        return Err(HistoryError::CapacityLimit {
+            needed_events: 1,
+            max_events: 0,
+            max_file_bytes,
+        });
+    };
+    let max_events = data_bytes / event_bytes;
+    if max_events == 0 {
+        return Err(HistoryError::CapacityLimit {
+            needed_events: 1,
+            max_events,
+            max_file_bytes,
+        });
+    }
+
+    Ok(max_events)
 }
 
 fn capacity_error() -> io::Error {
@@ -379,9 +485,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use bt_agent::BinderEvent;
-
-    use super::{CaptureHistory, EVENT_SIZE, HEADER_SIZE};
+    use super::{CaptureHistory, EVENT_SIZE, HEADER_SIZE, HistoryError};
+    use crate::BinderEvent;
 
     #[test]
     fn appends_and_loads_history_window() {
@@ -390,7 +495,7 @@ mod tests {
 
         for sequence in 0..5 {
             history
-                .append_for_test(test_event(sequence))
+                .append_event(test_event(sequence))
                 .expect("测试事件应可追加");
         }
 
@@ -415,7 +520,7 @@ mod tests {
 
         for sequence in 0..9 {
             history
-                .append_for_test(test_event(sequence))
+                .append_event(test_event(sequence))
                 .expect("测试事件应可追加");
         }
 
@@ -447,11 +552,41 @@ mod tests {
         let path = temp_path("layout");
         let mut history = CaptureHistory::create(path.clone(), 1).expect("历史文件应可创建");
         history
-            .append_for_test(test_event(1))
+            .append_event(test_event(1))
             .expect("测试事件应可追加");
 
         let metadata = fs::metadata(&path).expect("历史文件元数据应可读取");
         assert!(metadata.len() >= (HEADER_SIZE + EVENT_SIZE) as u64);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_append_after_max_file_bytes() {
+        let path = temp_path("capacity-limit");
+        let max_file_bytes = HEADER_SIZE as u64 + EVENT_SIZE as u64 * 2;
+        let mut history =
+            CaptureHistory::create_with_max_file_bytes(path.clone(), 1, max_file_bytes)
+                .expect("历史文件应可按指定上限创建");
+
+        history
+            .append_event(test_event(1))
+            .expect("第一条测试事件应可追加");
+        history
+            .append_event(test_event(2))
+            .expect("第二条测试事件应可追加");
+        let error = history
+            .append_event(test_event(3))
+            .expect_err("超过文件上限时应拒绝追加");
+
+        assert!(matches!(
+            error,
+            HistoryError::CapacityLimit {
+                needed_events: 3,
+                max_events: 2,
+                max_file_bytes: actual_max_file_bytes,
+            } if actual_max_file_bytes == max_file_bytes
+        ));
 
         let _ = fs::remove_file(path);
     }
@@ -464,7 +599,7 @@ mod tests {
         let mut history = CaptureHistory::create(path.clone(), 1).expect("历史文件应可创建");
 
         history
-            .append_for_test(test_event(1))
+            .append_event(test_event(1))
             .expect("受保护历史文件仍应可追加");
 
         let parent = path.parent().expect("历史文件应有父目录").to_path_buf();

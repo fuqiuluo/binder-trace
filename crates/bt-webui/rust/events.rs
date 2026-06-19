@@ -7,11 +7,12 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use bt_agent::{BinderEvent, CaptureConfig, SocketIpcClient};
+use bt_agent::{BinderEvent, CaptureConfig, CaptureHistory, HistoryError, SocketIpcClient};
 use bt_decoder::{AndroidPlatformMethods, parse_interface_token};
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +25,7 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const SLOW_TRANSACTION_US: u64 = 10_000;
 
 /// WebUI 事件源配置。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WebuiEventsConfig {
     /// 是否启动生产事件源；测试静态资源服务时可关闭。
     pub enabled: bool,
@@ -32,8 +33,12 @@ pub struct WebuiEventsConfig {
     pub capture_config: Option<CaptureConfig>,
     /// Android SDK 版本，用于平台 Binder 方法名解析。
     pub android_sdk: Option<u16>,
-    /// WebUI 内存中保留的最近事件数。
+    /// btcap 历史文件初始事件容量，满后按需扩容。
     pub max_events: usize,
+    /// WebUI btcap 历史文件路径。
+    pub history_path: Option<PathBuf>,
+    /// WebUI btcap 历史文件最大字节数。
+    pub max_history_bytes: u64,
 }
 
 impl Default for WebuiEventsConfig {
@@ -43,34 +48,36 @@ impl Default for WebuiEventsConfig {
             capture_config: None,
             android_sdk: None,
             max_events: DEFAULT_MAX_EVENTS,
+            history_path: None,
+            max_history_bytes: CaptureHistory::DEFAULT_MAX_FILE_BYTES,
         }
     }
 }
 
 /// 共享事件窗口。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct WebuiEventHub {
     state: Arc<Mutex<EventState>>,
 }
 
 impl WebuiEventHub {
     pub(crate) fn new(config: WebuiEventsConfig) -> Self {
-        let state = Arc::new(Mutex::new(EventState::new(config.max_events)));
+        let event_state = EventState::new(config.clone());
+        let should_spawn_collector = event_state.can_collect();
+        let state = Arc::new(Mutex::new(event_state));
         let hub = Self {
             state: Arc::clone(&state),
         };
 
-        if config.enabled {
+        if should_spawn_collector {
             spawn_collector(state, config);
-        } else {
-            hub.set_source_state(SourceState::Disabled, None);
         }
 
         hub
     }
 
     pub(crate) fn snapshot(&self, query: &EventsQuery) -> EventsResponse {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .expect("event state mutex should not poison");
@@ -84,24 +91,14 @@ impl WebuiEventHub {
             .expect("event state mutex should not poison");
         state.clear();
     }
-
-    fn set_source_state(&self, source_state: SourceState, error: Option<String>) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("event state mutex should not poison");
-        state.source_state = source_state;
-        state.error = error;
-    }
 }
 
-#[derive(Debug)]
 struct EventState {
-    events: VecDeque<ApiTraceEvent>,
+    history: Option<CaptureHistory>,
     call_summaries: BTreeMap<u64, CallSummary>,
+    reply_latencies: HashMap<u64, u64>,
     process_labels: HashMap<u32, String>,
-    max_events: usize,
-    total_count: u64,
+    android_methods: Option<AndroidPlatformMethods>,
     kernel_lost_count: u64,
     backend_evicted_count: u64,
     source_state: SourceState,
@@ -109,38 +106,72 @@ struct EventState {
 }
 
 impl EventState {
-    fn new(max_events: usize) -> Self {
-        Self {
-            events: VecDeque::with_capacity(max_events.max(1)),
+    fn new(config: WebuiEventsConfig) -> Self {
+        let mut state = Self {
+            history: None,
             call_summaries: BTreeMap::new(),
+            reply_latencies: HashMap::new(),
             process_labels: HashMap::new(),
-            max_events: max_events.max(1),
-            total_count: 0,
+            android_methods: config.android_sdk.map(AndroidPlatformMethods::new),
             kernel_lost_count: 0,
             backend_evicted_count: 0,
-            source_state: SourceState::Connecting,
+            source_state: if config.enabled {
+                SourceState::Connecting
+            } else {
+                SourceState::Disabled
+            },
             error: None,
+        };
+
+        if config.enabled {
+            let history_path = config
+                .history_path
+                .unwrap_or_else(default_webui_history_path);
+            match CaptureHistory::create_with_max_file_bytes(
+                history_path,
+                config.max_events.max(1),
+                config.max_history_bytes,
+            ) {
+                Ok(history) => {
+                    state.history = Some(history);
+                }
+                Err(error) => {
+                    state.source_state = SourceState::Error;
+                    state.error = Some(format!("创建 WebUI btcap 历史失败: {error}"));
+                }
+            }
         }
+
+        state
     }
 
-    fn snapshot(&self, query: &EventsQuery) -> EventsResponse {
+    fn can_collect(&self) -> bool {
+        self.source_state == SourceState::Connecting && self.history.is_some()
+    }
+
+    fn snapshot(&mut self, query: &EventsQuery) -> EventsResponse {
         let filter = EventFilter::from(query);
         let limit = query.limit();
-        let matched = self
-            .events
-            .iter()
-            .filter(|event| filter.matches(event))
-            .collect::<Vec<_>>();
-        let selected = select_page(&matched, query.page_request(), limit);
+        let selected = match self.select_events(&filter, query.page_request(), limit) {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.source_state = SourceState::Error;
+                self.error = Some(format!("读取 WebUI btcap 历史失败: {error}"));
+                SelectedPage::default()
+            }
+        };
+        let event_count = self.event_count();
+        let retained_count = usize::try_from(event_count).unwrap_or(usize::MAX);
         let oldest_seq = selected.events.first().map(|event| event.raw.seq);
         let newest_seq = selected.events.last().map(|event| event.raw.seq);
-        let events = selected.events.into_iter().cloned().collect();
+        let matched_count = selected.matched_count;
+        let interfaces = self.interface_options();
 
         EventsResponse {
-            events,
-            total_count: self.total_count,
-            retained_count: self.events.len(),
-            matched_count: matched.len() as u64,
+            events: selected.events,
+            total_count: event_count,
+            retained_count,
+            matched_count,
             dropped_count: self.kernel_lost_count,
             backend_evicted_count: self.backend_evicted_count,
             oldest_seq,
@@ -152,8 +183,8 @@ impl EventState {
                 .is_some_and(|start_index| start_index > 1),
             has_more_after: selected
                 .end_index
-                .is_some_and(|end_index| end_index < matched.len() as u64),
-            interfaces: self.interface_options(),
+                .is_some_and(|end_index| end_index < matched_count),
+            interfaces,
             source_state: self.source_state,
             error: self.error.clone(),
             device_context: "production · binder transaction stream",
@@ -161,25 +192,54 @@ impl EventState {
     }
 
     fn clear(&mut self) {
-        self.events.clear();
+        if let Some(history) = self.history.as_mut() {
+            if let Err(error) = history.clear() {
+                self.source_state = SourceState::Error;
+                self.error = Some(format!("清空 WebUI btcap 历史失败: {error}"));
+            }
+        }
         self.call_summaries.clear();
-        self.total_count = 0;
+        self.reply_latencies.clear();
         self.kernel_lost_count = 0;
         self.backend_evicted_count = 0;
     }
 
-    fn push_event(&mut self, event: ApiTraceEvent, lost_before: u32) {
-        self.total_count += 1;
+    fn push_event(&mut self, event: BinderEvent) -> Result<(), HistoryError> {
+        let Some(history) = self.history.as_mut() else {
+            return Ok(());
+        };
+
+        history.append_event(event)?;
         self.kernel_lost_count = self
             .kernel_lost_count
-            .saturating_add(u64::from(lost_before));
-        self.events.push_back(event);
-        while self.events.len() > self.max_events {
-            if let Some(evicted) = self.events.pop_front() {
-                self.call_summaries.remove(&evicted.enrichment.debug_id);
+            .saturating_add(u64::from(event.lost_before));
+        self.observe_event(&event);
+        Ok(())
+    }
+
+    fn observe_event(&mut self, event: &BinderEvent) {
+        let debug_id = debug_id(event);
+        if event.is_reply() {
+            if let Some(latency_us) = self.reply_latency(event) {
+                self.reply_latencies
+                    .insert(u64::from(event.reply_to_debug_id), latency_us);
             }
-            self.backend_evicted_count += 1;
+            return;
         }
+
+        let (interface, method) = self.call_target(event);
+        self.call_summaries.insert(
+            debug_id,
+            CallSummary {
+                interface,
+                method,
+                timestamp_ns: event.timestamp_ns,
+            },
+        );
+    }
+
+    fn event_count(&self) -> u64 {
+        self.history.as_ref().map_or(0, CaptureHistory::event_count)
     }
 
     fn process_label(&mut self, tgid: u32) -> String {
@@ -192,12 +252,23 @@ impl EventState {
         label
     }
 
-    fn interface_options(&self) -> Vec<String> {
+    fn interface_options(&mut self) -> Vec<String> {
         let mut counts = HashMap::<String, usize>::new();
-        for event in &self.events {
-            *counts
-                .entry(event.enrichment.interface.clone())
-                .or_default() += 1;
+        for index in 0..self.event_count() {
+            let event = match self.event_at(index) {
+                Ok(event) => event,
+                Err(error) => {
+                    self.source_state = SourceState::Error;
+                    self.error = Some(format!("读取 WebUI interface 列表失败: {error}"));
+                    break;
+                }
+            };
+            let interface = if event.is_reply() {
+                self.reply_enrichment(&event).0
+            } else {
+                self.call_target(&event).0
+            };
+            *counts.entry(interface).or_default() += 1;
         }
 
         let mut entries = counts.into_iter().collect::<Vec<_>>();
@@ -207,6 +278,133 @@ impl EventState {
             .take(MAX_INTERFACE_OPTIONS)
             .map(|entry| entry.0)
             .collect()
+    }
+
+    fn select_events(
+        &mut self,
+        filter: &EventFilter,
+        request: PageRequest,
+        limit: usize,
+    ) -> Result<SelectedPage, HistoryError> {
+        let mut selected = VecDeque::<SelectedEvent>::with_capacity(limit);
+        let mut matched_count = 0_u64;
+        let event_count = self.event_count();
+
+        for index in 0..event_count {
+            let event = self.event_at(index)?;
+            let api_event = self.api_event(&event);
+            if !filter.matches(&api_event) {
+                continue;
+            }
+
+            matched_count += 1;
+            if !request.matches(api_event.raw.seq) {
+                continue;
+            }
+
+            match request {
+                PageRequest::Latest | PageRequest::Before(_) => {
+                    selected.push_back(SelectedEvent {
+                        ordinal: matched_count,
+                        event: api_event,
+                    });
+                    while selected.len() > limit {
+                        selected.pop_front();
+                    }
+                }
+                PageRequest::After(_) => {
+                    if selected.len() < limit {
+                        selected.push_back(SelectedEvent {
+                            ordinal: matched_count,
+                            event: api_event,
+                        });
+                    }
+                }
+            }
+        }
+
+        let start_index = selected.front().map(|selected| selected.ordinal);
+        let end_index = selected.back().map(|selected| selected.ordinal);
+        let events = selected
+            .into_iter()
+            .map(|selected| selected.event)
+            .collect::<Vec<_>>();
+
+        Ok(SelectedPage {
+            events,
+            start_index,
+            end_index,
+            matched_count,
+        })
+    }
+
+    fn event_at(&self, index: u64) -> Result<BinderEvent, HistoryError> {
+        self.history
+            .as_ref()
+            .ok_or_else(|| HistoryError::Io(std::io::Error::other("WebUI btcap 历史未启用")))?
+            .event_at(index)
+            .map_err(HistoryError::Io)
+    }
+
+    fn api_event(&mut self, event: &BinderEvent) -> ApiTraceEvent {
+        let debug_id = debug_id(event);
+        let reply_to_debug_id =
+            (event.reply_to_debug_id != 0).then_some(u64::from(event.reply_to_debug_id));
+        let process_label = self.process_label(event.tgid);
+        let (interface, method, latency_us) = if event.is_reply() {
+            let (interface, method) = self.reply_enrichment(event);
+            (interface, method, self.reply_latency(event))
+        } else {
+            let (interface, method) = self.call_target(event);
+            let latency_us = self.reply_latencies.get(&debug_id).copied();
+            (interface, method, latency_us)
+        };
+        let status = classify_status(event, latency_us);
+
+        api_trace_event(
+            event,
+            interface,
+            method,
+            process_label,
+            debug_id,
+            reply_to_debug_id,
+            latency_us,
+            status,
+        )
+    }
+
+    fn call_target(&self, event: &BinderEvent) -> (String, String) {
+        let interface = parse_interface_token(event.payload_bytes())
+            .unwrap_or_else(|| format!("handle#{}", event.target_handle));
+        let method = self
+            .android_methods
+            .and_then(|methods| methods.lookup(&interface, event.code))
+            .map(|method| method.method.to_owned())
+            .unwrap_or_else(|| format!("code_{}", event.code));
+
+        (interface, method)
+    }
+
+    fn reply_enrichment(&self, event: &BinderEvent) -> (String, String) {
+        let Some(summary) = self.call_summaries.get(&u64::from(event.reply_to_debug_id)) else {
+            return (
+                format!("reply_to#{}", event.reply_to_debug_id),
+                format!("code_{}", event.code),
+            );
+        };
+
+        (summary.interface.clone(), summary.method.clone())
+    }
+
+    fn reply_latency(&self, event: &BinderEvent) -> Option<u64> {
+        self.call_summaries
+            .get(&u64::from(event.reply_to_debug_id))
+            .and_then(|summary| {
+                event
+                    .timestamp_ns
+                    .saturating_sub(summary.timestamp_ns)
+                    .checked_div(1_000)
+            })
     }
 }
 
@@ -280,6 +478,16 @@ enum PageRequest {
     After(u64),
 }
 
+impl PageRequest {
+    fn matches(self, seq: u64) -> bool {
+        match self {
+            Self::Latest => true,
+            Self::Before(before_seq) => seq < before_seq,
+            Self::After(after_seq) => seq > after_seq,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DirectionFilter {
@@ -333,47 +541,18 @@ impl From<&EventsQuery> for EventFilter {
     }
 }
 
-#[derive(Debug)]
-struct SelectedPage<'a> {
-    events: Vec<&'a ApiTraceEvent>,
+#[derive(Debug, Default)]
+struct SelectedPage {
+    events: Vec<ApiTraceEvent>,
     start_index: Option<u64>,
     end_index: Option<u64>,
+    matched_count: u64,
 }
 
-fn select_page<'a>(
-    matched: &[&'a ApiTraceEvent],
-    request: PageRequest,
-    limit: usize,
-) -> SelectedPage<'a> {
-    let (start, end) = match request {
-        PageRequest::Latest => {
-            let end = matched.len();
-            (end.saturating_sub(limit), end)
-        }
-        PageRequest::Before(seq) => {
-            let end = matched.partition_point(|event| event.raw.seq < seq);
-            (end.saturating_sub(limit), end)
-        }
-        PageRequest::After(seq) => {
-            let start = matched.partition_point(|event| event.raw.seq <= seq);
-            (start, start.saturating_add(limit).min(matched.len()))
-        }
-    };
-
-    let events = matched[start..end].to_vec();
-    if events.is_empty() {
-        return SelectedPage {
-            events,
-            start_index: None,
-            end_index: None,
-        };
-    }
-
-    SelectedPage {
-        events,
-        start_index: Some(start as u64 + 1),
-        end_index: Some(end as u64),
-    }
+#[derive(Debug)]
+struct SelectedEvent {
+    ordinal: u64,
+    event: ApiTraceEvent,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -488,10 +667,9 @@ fn collect_events(state: Arc<Mutex<EventState>>, config: WebuiEventsConfig) {
         state.error = None;
     }
 
-    let platform_methods = config.android_sdk.map(AndroidPlatformMethods::new);
     loop {
         match client.poll_event(POLL_TIMEOUT) {
-            Ok(true) => drain_events(&client, &state, platform_methods),
+            Ok(true) => drain_events(&client, &state),
             Ok(false) => {}
             Err(error) => {
                 set_error(&state, format!("等待内核事件失败: {error}"));
@@ -501,11 +679,7 @@ fn collect_events(state: Arc<Mutex<EventState>>, config: WebuiEventsConfig) {
     }
 }
 
-fn drain_events(
-    client: &SocketIpcClient,
-    state: &Arc<Mutex<EventState>>,
-    platform_methods: Option<AndroidPlatformMethods>,
-) {
+fn drain_events(client: &SocketIpcClient, state: &Arc<Mutex<EventState>>) {
     loop {
         let event = match client.try_recv_event() {
             Ok(Some(event)) => event,
@@ -521,31 +695,28 @@ fn drain_events(
         }
 
         let mut state = state.lock().expect("event state mutex should not poison");
-        let api_event = build_api_event(&event, &mut state, platform_methods);
-        state.push_event(api_event, event.lost_before);
+        if let Err(error) = state.push_event(event) {
+            let message = format!("写入 WebUI btcap 历史失败: {error}");
+            if matches!(error, HistoryError::CapacityLimit { .. }) {
+                let _ = client.set_config(CaptureConfig::disabled());
+            }
+            state.source_state = SourceState::Error;
+            state.error = Some(message);
+            return;
+        }
     }
 }
 
-fn build_api_event(
+fn api_trace_event(
     event: &BinderEvent,
-    state: &mut EventState,
-    platform_methods: Option<AndroidPlatformMethods>,
+    interface: String,
+    method: String,
+    process_label: String,
+    debug_id: u64,
+    reply_to_debug_id: Option<u64>,
+    latency_us: Option<u64>,
+    status: &'static str,
 ) -> ApiTraceEvent {
-    let debug_id = debug_id(event);
-    let reply_to_debug_id =
-        (event.reply_to_debug_id != 0).then_some(u64::from(event.reply_to_debug_id));
-    let process_label = state.process_label(event.tgid);
-    let (interface, method, latency_us) = if event.is_reply() {
-        reply_enrichment(event, state)
-    } else {
-        call_enrichment(event, state, platform_methods)
-    };
-    let status = classify_status(event, latency_us);
-
-    if let Some(reply_to_debug_id) = reply_to_debug_id {
-        update_call_latency(state, reply_to_debug_id, latency_us, status);
-    }
-
     ApiTraceEvent {
         raw: RawTraceRecord {
             device_id: "android",
@@ -592,73 +763,6 @@ fn build_api_event(
             latency_us,
             status,
         },
-    }
-}
-
-fn call_enrichment(
-    event: &BinderEvent,
-    state: &mut EventState,
-    platform_methods: Option<AndroidPlatformMethods>,
-) -> (String, String, Option<u64>) {
-    let interface = parse_interface_token(event.payload_bytes())
-        .unwrap_or_else(|| format!("handle#{}", event.target_handle));
-    let method = platform_methods
-        .and_then(|methods| methods.lookup(&interface, event.code))
-        .map(|method| method.method.to_owned())
-        .unwrap_or_else(|| format!("code_{}", event.code));
-
-    state.call_summaries.insert(
-        debug_id(event),
-        CallSummary {
-            interface: interface.clone(),
-            method: method.clone(),
-            timestamp_ns: event.timestamp_ns,
-        },
-    );
-
-    (interface, method, None)
-}
-
-fn reply_enrichment(event: &BinderEvent, state: &EventState) -> (String, String, Option<u64>) {
-    let Some(summary) = state
-        .call_summaries
-        .get(&u64::from(event.reply_to_debug_id))
-    else {
-        return (
-            format!("reply_to#{}", event.reply_to_debug_id),
-            format!("code_{}", event.code),
-            None,
-        );
-    };
-
-    let latency_us = event
-        .timestamp_ns
-        .saturating_sub(summary.timestamp_ns)
-        .checked_div(1_000);
-
-    (
-        summary.interface.clone(),
-        summary.method.clone(),
-        latency_us,
-    )
-}
-
-fn update_call_latency(
-    state: &mut EventState,
-    debug_id: u64,
-    latency_us: Option<u64>,
-    status: &'static str,
-) {
-    let Some(latency_us) = latency_us else {
-        return;
-    };
-
-    for event in state.events.iter_mut().rev() {
-        if event.enrichment.debug_id == debug_id {
-            event.enrichment.latency_us = Some(latency_us);
-            event.enrichment.status = status;
-            return;
-        }
     }
 }
 
@@ -772,4 +876,104 @@ fn set_error(state: &Arc<Mutex<EventState>>, message: String) {
     let mut state = state.lock().expect("event state mutex should not poison");
     state.source_state = SourceState::Error;
     state.error = Some(message);
+}
+
+fn default_webui_history_path() -> PathBuf {
+    let android_tmp = Path::new("/data/local/tmp");
+    if android_tmp.is_dir() {
+        android_tmp.join("binder-trace/webui-events.btcap")
+    } else {
+        PathBuf::from("binder-trace-webui.btcap")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn snapshot_reads_old_events_from_btcap_history() {
+        let path = temp_path("webui-history");
+        let mut state = EventState::new(WebuiEventsConfig {
+            enabled: true,
+            capture_config: None,
+            android_sdk: None,
+            max_events: 1,
+            history_path: Some(path.clone()),
+            max_history_bytes: CaptureHistory::DEFAULT_MAX_FILE_BYTES,
+        });
+
+        for sequence in 1..=5 {
+            state
+                .push_event(test_event(sequence))
+                .expect("测试事件应写入 WebUI btcap");
+        }
+
+        let latest = state.snapshot(&EventsQuery {
+            limit: Some(2),
+            ..EventsQuery::default()
+        });
+        assert_eq!(latest.total_count, 5);
+        assert_eq!(latest.retained_count, 5);
+        assert_eq!(latest.backend_evicted_count, 0);
+        assert_eq!(event_sequences(&latest), vec![4, 5]);
+        assert!(latest.has_more_before);
+
+        let older = state.snapshot(&EventsQuery {
+            limit: Some(2),
+            before_seq: Some(4),
+            ..EventsQuery::default()
+        });
+        assert_eq!(event_sequences(&older), vec![2, 3]);
+        assert_eq!(older.matched_count, 5);
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn event_sequences(response: &EventsResponse) -> Vec<u64> {
+        response.events.iter().map(|event| event.raw.seq).collect()
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("系统时间应晚于 UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "binder-trace-{name}-{}-{nanos}.btcap",
+            std::process::id()
+        ))
+    }
+
+    fn test_event(sequence: u64) -> BinderEvent {
+        BinderEvent {
+            sequence,
+            timestamp_ns: sequence * 1_000,
+            kind: 1,
+            pid: 100,
+            tgid: 100,
+            uid: 0,
+            reply: 0,
+            lost_before: 0,
+            transaction_debug_id: sequence as u32,
+            reply_to_debug_id: 0,
+            transaction: 0,
+            proc: 0,
+            thread: 0,
+            extra_buffers_size: 0,
+            code: sequence as u32,
+            flags: 0,
+            data_size: 0,
+            offsets_size: 0,
+            target_handle: 1,
+            sender_pid: 0,
+            sender_euid: 0,
+            payload_len: 0,
+            payload_truncated: 0,
+            reserved: [0; 7],
+            payload: [0; 256],
+        }
+    }
 }

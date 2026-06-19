@@ -27,6 +27,7 @@
 AGENTS.md
 /.claude
 /.agent
+.mcp.json
 
 # WebUI build artifacts
 crates/bt-webui/dist/*
