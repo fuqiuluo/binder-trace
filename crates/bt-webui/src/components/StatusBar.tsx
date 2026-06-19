@@ -5,6 +5,8 @@ import { formatNumber } from '../domain';
 
 interface StatusBarProps {
   visibleCount: number;
+  displayLimit: number;
+  displayLimitOptions: readonly number[];
   matchedCount: number;
   windowStartIndex: number | null;
   windowEndIndex: number | null;
@@ -13,10 +15,13 @@ interface StatusBarProps {
   isRunning: boolean;
   followTail: boolean;
   messages: Messages;
+  onDisplayLimitChange(value: number): void;
 }
 
 export function StatusBar({
   visibleCount,
+  displayLimit,
+  displayLimitOptions,
   matchedCount,
   windowStartIndex,
   windowEndIndex,
@@ -25,6 +30,7 @@ export function StatusBar({
   isRunning,
   followTail,
   messages,
+  onDisplayLimitChange,
 }: StatusBarProps) {
   const s = messages.streamStats;
   const st = messages.stream;
@@ -57,6 +63,22 @@ export function StatusBar({
         value={formatNumber(droppedCount)}
         tone={droppedCount > 0 ? 'danger' : undefined}
       />
+      <span className="bt-statusbar-spacer" />
+      <label className="bt-window-size">
+        <span className="bt-stat-label">{s.displayLimit}</span>
+        <select
+          className="bt-select bt-window-size-select"
+          value={displayLimit}
+          aria-label={s.displayLimit}
+          onChange={(event) => onDisplayLimitChange(Number(event.target.value))}
+        >
+          {displayLimitOptions.map((option) => (
+            <option key={option} value={option}>
+              {formatNumber(option)}
+            </option>
+          ))}
+        </select>
+      </label>
     </footer>
   );
 }

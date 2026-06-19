@@ -43,6 +43,7 @@ export const zhCN = {
   streamStats: {
     position: '下标',
     visible: '可见',
+    displayLimit: '显示',
     total: '总计',
     dropped: '丢弃',
   },

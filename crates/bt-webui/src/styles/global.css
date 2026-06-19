@@ -769,6 +769,26 @@ textarea {
   height: 14px;
   background: var(--bt-border);
 }
+.bt-statusbar-spacer {
+  flex: 1 1 auto;
+  min-width: 16px;
+}
+.bt-window-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.bt-window-size-select {
+  height: 22px;
+  min-width: 84px;
+  padding-left: 8px;
+  padding-right: 24px;
+  font-family: var(--bt-font-mono);
+  font-size: 11px;
+  border-radius: var(--bt-radius-sm);
+  background-position: right 7px center;
+}
 
 /* ============ 详情面板 ============ */
 

@@ -2,7 +2,7 @@
 //!
 //! 只负责状态编排与布局：筛选条件交给后端执行，前端仅排序和渲染当前窗口。
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DetailPanel } from '../components/DetailPanel';
 import { EventTable } from '../components/EventTable';
 import { FilterBar } from '../components/FilterBar';
@@ -23,15 +23,18 @@ import {
 
 // 默认按时间升序：新事件追加到列表底部（向下新增），配合 follow tail 滚到底部跟随。
 const INITIAL_SORT: TraceSort = { column: 'time', direction: 'asc' };
+const DISPLAY_LIMIT_OPTIONS = [256, 1024, 4096] as const;
+const DISPLAY_LIMIT_STORAGE_KEY = 'bt-webui.trace.display-limit.v1';
 
 export function App() {
   const { locale, messages, setLocale } = useI18n();
 
   const [filters, setFilters] = useState<TraceFilters>(EMPTY_FILTERS);
-  const stream = useTraceStream(filters);
+  const [displayLimit, setDisplayLimit] = useState(loadDisplayLimit);
   const [sort, setSort] = useState<TraceSort>(INITIAL_SORT);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detailWidth, setDetailWidth] = useState(460);
+  const stream = useTraceStream(filters, displayLimit);
 
   const tableScrollRef = useRef<HTMLDivElement>(null);
   const detailRef = useRef<HTMLDivElement>(null);
@@ -76,6 +79,11 @@ export function App() {
     setSelectedId(null);
   }, [stream]);
 
+  const handleDisplayLimit = useCallback((value: number) => {
+    setDisplayLimit(normalizeDisplayLimit(value));
+    setSelectedId(null);
+  }, []);
+
   const handleExport = useCallback(() => {
     const payload = JSON.stringify(
       { device: stream.deviceContext, exported_at: new Date().toISOString(), events: sortedEvents.map((event) => event.raw) },
@@ -100,6 +108,10 @@ export function App() {
     onClear: handleClearSelection,
     onEnter: () => detailRef.current?.focus(),
   });
+
+  useEffect(() => {
+    persistDisplayLimit(displayLimit);
+  }, [displayLimit]);
 
   return (
     <div className="bt-app">
@@ -160,6 +172,8 @@ export function App() {
       </div>
       <StatusBar
         visibleCount={sortedEvents.length}
+        displayLimit={displayLimit}
+        displayLimitOptions={DISPLAY_LIMIT_OPTIONS}
         matchedCount={stream.matchedCount}
         windowStartIndex={stream.windowStartIndex}
         windowEndIndex={stream.windowEndIndex}
@@ -168,7 +182,35 @@ export function App() {
         isRunning={stream.isRunning}
         followTail={stream.followTail}
         messages={messages}
+        onDisplayLimitChange={handleDisplayLimit}
       />
     </div>
   );
+}
+
+function loadDisplayLimit(): number {
+  try {
+    const raw = window.localStorage.getItem(DISPLAY_LIMIT_STORAGE_KEY);
+    if (raw !== null) {
+      return normalizeDisplayLimit(Number(raw));
+    }
+  } catch {
+    return DISPLAY_LIMIT_OPTIONS[0];
+  }
+
+  return DISPLAY_LIMIT_OPTIONS[0];
+}
+
+function persistDisplayLimit(value: number) {
+  try {
+    window.localStorage.setItem(DISPLAY_LIMIT_STORAGE_KEY, String(value));
+  } catch {
+    // localStorage 不可用时只影响偏好保存，不影响当前会话切换。
+  }
+}
+
+function normalizeDisplayLimit(value: number): number {
+  return DISPLAY_LIMIT_OPTIONS.includes(value as (typeof DISPLAY_LIMIT_OPTIONS)[number])
+    ? value
+    : DISPLAY_LIMIT_OPTIONS[0];
 }

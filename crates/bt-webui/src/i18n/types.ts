@@ -51,6 +51,7 @@ export interface Messages {
   streamStats: {
     position: string;
     visible: string;
+    displayLimit: string;
     total: string;
     dropped: string;
   };

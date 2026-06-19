@@ -43,6 +43,7 @@ export const enUS = {
   streamStats: {
     position: 'index',
     visible: 'visible',
+    displayLimit: 'show',
     total: 'total',
     dropped: 'dropped',
   },

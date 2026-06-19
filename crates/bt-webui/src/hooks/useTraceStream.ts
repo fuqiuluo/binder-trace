@@ -8,8 +8,6 @@ import { buildTraceEvent, type TraceEnrichment, type TraceEvent } from '../domai
 import type { RawTraceRecord, TraceFilters } from '../domain';
 
 const POLL_INTERVAL_MS = 600;
-const EVENT_WINDOW_LIMIT = 256;
-const PAGE_LOAD_LIMIT = 128;
 const DEFAULT_DEVICE_CONTEXT = 'production · binder transaction stream';
 
 interface ApiTraceEvent {
@@ -65,7 +63,7 @@ export interface TraceStream {
   clear(): void;
 }
 
-export function useTraceStream(filters: TraceFilters): TraceStream {
+export function useTraceStream(filters: TraceFilters, windowLimit: number): TraceStream {
   const [events, setEvents] = useState<TraceEvent[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [retainedCount, setRetainedCount] = useState(0);
@@ -105,7 +103,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
     setHasMoreAfter(data.has_more_after);
 
     const pageEvents = materializeEvents(eventCacheRef.current, data.events);
-    const nextEvents = mergeWindow(eventsRef.current, pageEvents, mode);
+    const nextEvents = mergeWindow(eventsRef.current, pageEvents, mode, windowLimit);
     const nextRange = nextWindowRange(data, mode, nextEvents.length);
     eventsRef.current = nextEvents;
     windowRangeRef.current = nextRange;
@@ -113,7 +111,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
     setEvents(nextEvents);
     setWindowStartIndex(nextRange.start);
     setWindowEndIndex(nextRange.end);
-  }, []);
+  }, [windowLimit]);
 
   const fetchPage = useCallback(
     async (request: PageRequest, generation: number, signal?: AbortSignal) => {
@@ -140,7 +138,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
     const generation = requestGenerationRef.current;
 
     try {
-      await fetchPage({ mode: 'latest', limit: EVENT_WINDOW_LIMIT }, generation, controller.signal);
+      await fetchPage({ mode: 'latest', limit: windowLimit }, generation, controller.signal);
     } catch (caught) {
       if (controller.signal.aborted) {
         return;
@@ -148,7 +146,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
       setSourceState('error');
       setError(caught instanceof Error ? caught.message : String(caught));
     }
-  }, [fetchPage]);
+  }, [fetchPage, windowLimit]);
 
   useEffect(() => {
     requestGenerationRef.current += 1;
@@ -162,7 +160,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
     setHasMoreAfter(false);
     setFollowTail(true);
     void refreshLatest();
-  }, [filters, refreshLatest]);
+  }, [filters, refreshLatest, windowLimit]);
 
   useEffect(() => {
     if (!isRunning || !followTail) {
@@ -209,7 +207,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
     setLoadingBefore(true);
     try {
       await fetchPage(
-        { mode: 'older', limit: PAGE_LOAD_LIMIT, beforeSeq: firstSeq },
+        { mode: 'older', limit: pageLoadLimit(windowLimit), beforeSeq: firstSeq },
         requestGenerationRef.current,
       );
     } catch (caught) {
@@ -218,7 +216,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
     } finally {
       setLoadingBefore(false);
     }
-  }, [fetchPage, hasMoreBefore, isLoadingBefore]);
+  }, [fetchPage, hasMoreBefore, isLoadingBefore, windowLimit]);
 
   const loadNewer = useCallback(async () => {
     const lastSeq = eventsRef.current.at(-1)?.seq;
@@ -229,7 +227,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
     setLoadingAfter(true);
     try {
       await fetchPage(
-        { mode: 'newer', limit: PAGE_LOAD_LIMIT, afterSeq: lastSeq },
+        { mode: 'newer', limit: pageLoadLimit(windowLimit), afterSeq: lastSeq },
         requestGenerationRef.current,
       );
     } catch (caught) {
@@ -238,7 +236,7 @@ export function useTraceStream(filters: TraceFilters): TraceStream {
     } finally {
       setLoadingAfter(false);
     }
-  }, [fetchPage, hasMoreAfter, isLoadingAfter]);
+  }, [fetchPage, hasMoreAfter, isLoadingAfter, windowLimit]);
 
   return {
     events,
@@ -320,9 +318,14 @@ function materializeEvents(
   });
 }
 
-function mergeWindow(previous: TraceEvent[], pageEvents: TraceEvent[], mode: PageMode): TraceEvent[] {
+function mergeWindow(
+  previous: TraceEvent[],
+  pageEvents: TraceEvent[],
+  mode: PageMode,
+  windowLimit: number,
+): TraceEvent[] {
   if (mode === 'latest') {
-    return trimWindow(dedupeEvents(pageEvents), 'end');
+    return trimWindow(dedupeEvents(pageEvents), 'end', windowLimit);
   }
   if (pageEvents.length === 0) {
     return previous;
@@ -330,7 +333,7 @@ function mergeWindow(previous: TraceEvent[], pageEvents: TraceEvent[], mode: Pag
   const merged = mode === 'older'
     ? dedupeEvents([...pageEvents, ...previous])
     : dedupeEvents([...previous, ...pageEvents]);
-  return trimWindow(merged, mode === 'older' ? 'start' : 'end');
+  return trimWindow(merged, mode === 'older' ? 'start' : 'end', windowLimit);
 }
 
 function nextWindowRange(
@@ -372,13 +375,17 @@ function dedupeEvents(events: TraceEvent[]): TraceEvent[] {
   return unique;
 }
 
-function trimWindow(events: TraceEvent[], keep: 'start' | 'end'): TraceEvent[] {
-  if (events.length <= EVENT_WINDOW_LIMIT) {
+function trimWindow(events: TraceEvent[], keep: 'start' | 'end', windowLimit: number): TraceEvent[] {
+  if (events.length <= windowLimit) {
     return events;
   }
   return keep === 'start'
-    ? events.slice(0, EVENT_WINDOW_LIMIT)
-    : events.slice(events.length - EVENT_WINDOW_LIMIT);
+    ? events.slice(0, windowLimit)
+    : events.slice(events.length - windowLimit);
+}
+
+function pageLoadLimit(windowLimit: number): number {
+  return Math.min(windowLimit, Math.max(128, Math.floor(windowLimit / 2)));
 }
 
 function pruneCache(

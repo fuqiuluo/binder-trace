@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_EVENTS: usize = 65_536;
 const DEFAULT_QUERY_LIMIT: usize = 256;
-const MAX_QUERY_LIMIT: usize = 256;
+const MAX_QUERY_LIMIT: usize = 4_096;
 const MAX_INTERFACE_OPTIONS: usize = 512;
 const TF_ONE_WAY: u32 = 0x01;
 const POLL_TIMEOUT: Duration = Duration::from_millis(250);
