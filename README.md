@@ -1,5 +1,7 @@
 # binder-trace
 
+[English](README.en.md) | 中文
+
 `binder-trace` 是一个 Android Binder 调用观测工具。它通过内核模块采集 Binder transaction，在用户态提供 WebUI、TUI 和 JSONL 输出，适合排查系统服务调用、接口频率、payload 和 reply 关联关系。
 
 ## 效果图
