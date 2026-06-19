@@ -1,0 +1,107 @@
+name: Build Android user-space binaries
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+    paths:
+      - ".github/workflows/android-userspace.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "android/**"
+      - "crates/**"
+      - "xtask/**"
+  pull_request:
+    paths:
+      - ".github/workflows/android-userspace.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "android/**"
+      - "crates/**"
+      - "xtask/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_API: "23"
+  ANDROID_NDK_VERSION: "27.1.12297006"
+
+jobs:
+  build-android:
+    name: Build binder-trace for ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            clang_prefix: aarch64-linux-android
+            linker_env: CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+            artifact: binder-trace-aarch64-linux-android
+          - target: x86_64-linux-android
+            clang_prefix: x86_64-linux-android
+            linker_env: CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER
+            artifact: binder-trace-x86_64-linux-android
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install Android NDK
+        run: |
+          set -euo pipefail
+
+          android_home="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$android_home" ]; then
+            echo "ANDROID_HOME or ANDROID_SDK_ROOT is required" >&2
+            exit 2
+          fi
+
+          sdkmanager_bin="$android_home/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$sdkmanager_bin" ]; then
+            sdkmanager_bin="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$sdkmanager_bin" ]; then
+            echo "sdkmanager is required" >&2
+            exit 2
+          fi
+
+          yes | "$sdkmanager_bin" --licenses >/dev/null || true
+          "$sdkmanager_bin" "ndk;${ANDROID_NDK_VERSION}"
+
+          ndk_home="$android_home/ndk/${ANDROID_NDK_VERSION}"
+          test -d "$ndk_home"
+          echo "ANDROID_NDK_HOME=$ndk_home" >> "$GITHUB_ENV"
+
+      - name: Build binder-trace
+        run: |
+          set -euo pipefail
+
+          linker="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.clang_prefix }}${ANDROID_API}-clang"
+          test -x "$linker"
+          export "${{ matrix.linker_env }}=$linker"
+
+          cargo build --locked -p bt-cli --bin binder-trace --target "${{ matrix.target }}"
+
+          output="target/${{ matrix.target }}/debug/binder-trace"
+          test -x "$output"
+          file "$output"
+          mkdir -p "out/${{ matrix.target }}"
+          cp "$output" "out/${{ matrix.target }}/binder-trace"
+
+      - name: Upload binder-trace artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/${{ matrix.target }}/binder-trace
