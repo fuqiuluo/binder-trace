@@ -1,29 +1,29 @@
 # binder-trace
 
-Binder trace 工具工作区，用于研究和实现 Android Binder 调用观测、内核模块采集、事件解码、实时 TUI 和 JSONL 输出。
+`binder-trace` 是一个 Android Binder 调用观测工具。它通过内核模块采集 Binder transaction，在用户态提供 WebUI、TUI 和 JSONL 输出，适合排查系统服务调用、接口频率、payload 和 reply 关联关系。
 
 ## 效果图
 
-| TUI                                                                                | WebUI                                                                                  |
-|------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
-| [![binder-trace TUI 演示](docs/assets/tui-demo-thumb.png)](docs/assets/tui-demo.png) | [![binder-trace WebUI 演示](docs/assets/webui-demo-thumb.png)](docs/assets/webui-demo.png) |
+| WebUI                                                                                  | TUI                                                                                |
+|----------------------------------------------------------------------------------------|------------------------------------------------------------------------------------|
+| [![binder-trace WebUI 演示](docs/assets/webui-demo-thumb.png)](docs/assets/webui-demo.png) | [![binder-trace TUI 演示](docs/assets/tui-demo-thumb.png)](docs/assets/tui-demo.png) |
 
-## 目录结构
+## 功能
 
-- `xtask/`: 本地任务和开发命令入口。
-- `kernel/`: Android 内核模块、inline hook、符号解析和 DDK 构建脚本。
-- `crates/bt-common/`: 内核侧和用户态共享的数据结构，保持小型、稳定、C-layout 友好。
-- `crates/bt-agent/`: 用户态核心库，负责连接内核模块控制协议族和读取事件流。
-- `crates/bt-decoder/`: raw Binder 事件流解码层，包含 Android 平台 Binder 方法表。
-- `crates/bt-storage/`: JSONL 输出层，后续可扩展 SQLite。
-- `crates/bt-cli/`: `binder-trace` 命令行入口和实时 TUI。
-- `crates/bt-cli/src/tui/`: TUI 状态、输入、渲染、主题、文本宽度和 i18n 模块。
-- `crates/bt-cli/src/tui/locales/`: TUI 文案 JSON 资源文件。
-- `crates/bt-webui/`: 内嵌 WebUI，提供浏览器里的 Binder 事件表格、筛选、详情和按需分页。
+- 实时采集 Android Binder transaction。
+- WebUI: 表格、搜索、方向/接口筛选、详情侧栏、payload/原始 JSON、关联调用、按需分页、可调列宽。
+- TUI: 终端内实时事件列表、频率统计、hexdump 和解析详情。
+- JSONL: 输出稳定的事件消息，方便接入脚本或后续分析。
+- 支持按 `tgid`、`pid`、`uid` 缩小采集范围。
 
-## 快速使用
+## 准备条件
 
-只想使用成品时，不需要克隆仓库或拷贝脚本。先确认设备架构、内核版本和 root 权限:
+- 已 root 的 Android 设备。
+- 本机安装 `adb`。
+- 与设备 ABI 匹配的 `binder-trace` 用户态二进制。
+- 与设备内核版本匹配的 `bt-kmod.ko` 内核模块。
+
+先确认设备信息:
 
 ```bash
 adb shell getprop ro.product.cpu.abi
@@ -31,12 +31,9 @@ adb shell uname -r
 adb shell su -c id
 ```
 
-从 Release 下载两个文件:
+## 安装到设备
 
-- 用户态二进制: 选择和设备 ABI 匹配的 `binder-trace`，例如 `arm64-v8a` / `aarch64-linux-android`。
-- 内核模块: 选择和设备 `uname -r` 或 Release 说明匹配的 `.ko` 文件。
-
-下面命令假设下载后的本地文件名是 `binder-trace` 和 `bt-kmod.ko`:
+从 Release 下载 `binder-trace` 和对应设备内核的 `bt-kmod.ko`，然后推送到设备:
 
 ```bash
 adb shell mkdir -p /data/local/tmp/binder-trace
@@ -51,83 +48,81 @@ adb shell chmod 755 /data/local/tmp/binder-trace/binder-trace
 adb shell su -c 'insmod /data/local/tmp/binder-trace/bt-kmod.ko'
 ```
 
-如果设备上已经加载过旧模块，可以先执行 `adb shell su -c 'rmmod bt_kmod'` 再重新 `insmod`。卸载时会等待已经进入 Binder hook 的调用退出；如果设备上有长时间阻塞的 Binder read/looper 线程，`rmmod` 可能等待较久。
-
-确认模块加载成功:
+确认模块可用:
 
 ```bash
 adb shell su -c 'lsmod | grep bt_kmod'
-adb shell su -c "dmesg | grep -i 'binder-trace\|bt_kmod' | tail -30"
 adb shell su -c '/data/local/tmp/binder-trace/binder-trace ipc feature'
 ```
 
-`binder-trace` 进入真实运行路径时会 best-effort 写入启动检测点 `/data/local/tmp/.fuqiuluo`。这个文件用于合规 App 判断审计工具是否运行过，不作为隐藏驻留或反篡改机制；`--help`、参数解析失败等未进入运行路径的情况不会写入。
+如果设备已经加载过旧模块，可以先卸载:
 
-启动 TUI 建议进入交互 shell，避免非交互 `adb shell su -c` 影响终端按键和尺寸:
+```bash
+adb shell su -c 'rmmod bt_kmod'
+```
+
+`rmmod` 会等待已经进入 Binder hook 的线程退出。如果设备上有长时间阻塞的 Binder read/looper 线程，卸载可能需要等待一段时间。
+
+## 使用 WebUI
+
+WebUI 是推荐的日常查看方式。先转发端口:
+
+```bash
+adb forward tcp:5173 tcp:5173
+```
+
+在设备上启动 WebUI:
 
 ```bash
 adb shell
 su
-/data/local/tmp/binder-trace/binder-trace tui
+cd /data/local/tmp/binder-trace
+./binder-trace webui --listen 127.0.0.1:5173
 ```
 
-## 从源码构建
+然后在电脑浏览器打开:
 
-开发者常用检查和本机运行命令:
-
-```bash
-cargo run -p xtask -- check
-cargo run -p xtask -- run --output trace.jsonl
-cargo run -p bt-cli --bin binder-trace -- --output trace.jsonl
-cargo run -p bt-cli --bin binder-trace -- tui --help
+```text
+http://127.0.0.1:5173/
 ```
 
-构建 Android 用户态二进制并推送到设备:
+常用参数:
 
 ```bash
-export ANDROID_NDK_HOME=/path/to/android-ndk
-android/push.sh
+./binder-trace webui --uid 1000
+./binder-trace webui --tgid 12345
+./binder-trace webui --pid 12345
+./binder-trace webui --no-enable
+./binder-trace webui --android-sdk 35
 ```
 
-`android/push.sh` 默认使用 debug profile 构建 `aarch64-linux-android` 用户态二进制，并推送到 `/data/local/tmp/binder-trace/binder-trace`。需要调整构建或设备路径时可设置:
+说明:
 
-- `BINDER_TRACE_ANDROID_TARGET`
-- `BINDER_TRACE_ANDROID_API`
-- `BINDER_TRACE_PROFILE`
-- `BINDER_TRACE_REMOTE_DIR`
-- `BINDER_TRACE_BIN`
-- `BINDER_TRACE_DEVICE_ID`
+- 默认会启用 Binder transaction 捕获配置。
+- `--no-enable` 只读取现有事件流，不修改内核捕获配置。
+- WebUI 的过滤和分页在后端执行，浏览器只渲染当前窗口。
+- 右下角可以切换当前渲染窗口大小: `256`、`1024`、`4096`。
 
-构建内核模块:
+## 使用 TUI
+
+TUI 适合在终端里快速查看事件。建议使用交互 shell，避免非交互 `adb shell su -c` 影响按键和终端尺寸:
 
 ```bash
-kernel/scripts/build-ddk.sh build android14-6.1
+adb shell
+su
+cd /data/local/tmp/binder-trace
+./binder-trace tui
 ```
 
-需要看 agent 自身调试日志时，通过 `RUST_LOG` 控制 stderr 输出:
+常用参数:
 
 ```bash
-RUST_LOG=bt_agent=debug android/run-root.sh tui
-RUST_LOG=bt_agent=trace android/run-root.sh tui
-```
-
-## 实时 TUI
-
-TUI 从内核模块事件流读取 `binder_transaction`，默认启用捕获配置并清空内核统计。界面分为四个窗格:
-
-- `Transactions`: 展示 `Seq / Dir / Interface / # / Len / Method`，优先保证 `Interface` 可读，`Method` 在最右侧并允许截断。
-- `Frequency`: 按 `interface + code` 聚合频次，支持对当前项开关过滤。
-- `Hexdump`: 展示当前事件 payload。
-- `Parsed Transaction`: 展示当前事件的解析字段和关联后的 reply 摘要。
-
-常用启动参数:
-
-```bash
-/data/local/tmp/binder-trace/binder-trace tui --rows 1024 --refresh-ms 100
-/data/local/tmp/binder-trace/binder-trace tui --tgid 12345
-/data/local/tmp/binder-trace/binder-trace tui --uid 1000
-/data/local/tmp/binder-trace/binder-trace tui --no-enable
-/data/local/tmp/binder-trace/binder-trace tui --history-path /data/local/tmp/binder-trace/events.btcap
+./binder-trace tui --rows 1024 --refresh-ms 100
+./binder-trace tui --uid 1000
+./binder-trace tui --tgid 12345
+./binder-trace tui --pid 12345
+./binder-trace tui --no-enable
+./binder-trace tui --history-path /data/local/tmp/binder-trace/events.btcap
 ```
 
 TUI 默认历史文件:
@@ -135,60 +130,20 @@ TUI 默认历史文件:
 - Android 设备: `/data/local/tmp/binder-trace/events.btcap`
 - 其他环境: `binder-trace.btcap`
 
-历史文件是二进制 `btcap` 格式，TUI 会把事件写入 mmap 文件，并在向上滚动时从历史窗口回读旧事件。
+界面语言会根据 Android locale 或 `LANG` / `LC_*` 环境变量选择。目前内置 English、中文、日本語。
 
-## TUI 语言资源
+## 输出 JSONL
 
-TUI 状态栏和按键提示会检测系统语言:
-
-1. Android: `persist.sys.locale`、`ro.product.locale`、`ro.product.locale.language`
-2. 环境变量: `LC_ALL`、`LC_MESSAGES`、`LANGUAGE`、`LANG`
-
-当前支持:
-
-- English: `crates/bt-cli/src/tui/locales/en-US.json`
-- 中文: `crates/bt-cli/src/tui/locales/zh-CN.json`
-- 日本語: `crates/bt-cli/src/tui/locales/ja-JP.json`
-
-资源通过 `include_bytes!` 编进二进制，并用 `serde_json` 解析。资源结构使用 `serde(deny_unknown_fields)` 校验；JSON 缺字段、字段名错误或格式无效时会直接 panic，测试会覆盖三份内置资源。
-
-## 内核模块
-
-内核模块构建脚本位于 `kernel/scripts/`，默认产物名为 `bt-kmod.ko`。常用命令:
+无子命令运行时，`binder-trace` 输出 JSONL 消息，适合脚本处理或保存:
 
 ```bash
-kernel/scripts/build-ddk.sh build android14-6.1
-kernel/scripts/build-ddk.sh clean android14-6.1
+adb shell
+su
+cd /data/local/tmp/binder-trace
+./binder-trace --output trace.jsonl
 ```
 
-模块加载辅助脚本为:
-
-```bash
-kernel/scripts/insmod_ko.sh bt-kmod.ko
-```
-
-当前内核模块支持使用 `rmmod bt_kmod` 卸载。卸载时模块会先设置 draining 标记，停止新采集，恢复 Binder hook 入口，然后等待已经进入 hook 的调用退出，最后释放 trampoline 和控制面资源。因为 `binder_ioctl()` 可能在 Binder read/looper 路径里长时间阻塞，所以 `rmmod` 可能等待较久；这是为了避免卸载后返回到已经释放的模块代码。
-
-## 输出格式
-
-无子命令运行时，`binder-trace` 输出 JSONL 消息信封，方便后续写入消息队列。外层携带设备和路由信息，具体事件内容放在 `data` 下，避免把不同 source 的字段平铺混在一起。
-
-程序启动后会先输出当前程序版本事件:
-
-```json
-{
-  "device_id": "2957c54c",
-  "seq": 0,
-  "timestamp_ns": 123456789,
-  "object": "program.version",
-  "data": {
-    "program": "binder-trace",
-    "version": "0.1.0"
-  }
-}
-```
-
-后续采集或诊断事件继续使用同一个 `seq` 递增:
+事件外层是统一消息信封，`object` 表示事件类型，`data` 是对应载荷:
 
 ```json
 {
@@ -207,7 +162,65 @@ kernel/scripts/insmod_ko.sh bt-kmod.ko
 }
 ```
 
-内核模块事件 reader 接入后，采集事件会继续复用同一套消息信封，保证 `seq` 单调递增。
+## 从源码构建
+
+运行项目检查:
+
+```bash
+cargo run -p xtask -- check
+cargo test --workspace
+```
+
+构建并推送 Android 用户态二进制:
+
+```bash
+export ANDROID_NDK_HOME=/path/to/android-ndk
+android/push.sh
+```
+
+`android/push.sh` 默认构建 `aarch64-linux-android` debug 二进制，并推送到 `/data/local/tmp/binder-trace/binder-trace`。可用环境变量调整:
+
+- `BINDER_TRACE_ANDROID_TARGET`
+- `BINDER_TRACE_ANDROID_API`
+- `BINDER_TRACE_PROFILE`
+- `BINDER_TRACE_REMOTE_DIR`
+- `BINDER_TRACE_BIN`
+- `BINDER_TRACE_DEVICE_ID`
+
+构建 Android 内核模块:
+
+```bash
+kernel/scripts/build-ddk.sh build android14-6.1
+```
+
+清理内核模块构建产物:
+
+```bash
+kernel/scripts/build-ddk.sh clean android14-6.1
+```
+
+## 仓库结构
+
+- `kernel/`: Android 内核模块、hook、UAPI 和 DDK 构建脚本。
+- `android/`: adb 推送和设备运行辅助脚本。
+- `crates/bt-common/`: 内核侧和用户态共享的固定布局类型。
+- `crates/bt-agent/`: 用户态事件读取、控制协议和诊断。
+- `crates/bt-decoder/`: Binder 事件解码和 Android 平台方法表。
+- `crates/bt-storage/`: JSONL 持久化。
+- `crates/bt-cli/`: `binder-trace` 命令行入口和 TUI。
+- `crates/bt-webui/`: 内嵌 WebUI。
+- `xtask/`: 本地开发命令封装。
+- `docs/`: 截图和开发文档。
+
+## 注意事项
+
+- `binder-trace` 进入真实运行路径时会 best-effort 写入 `/data/local/tmp/.fuqiuluo`，用于标记工具已经运行过。`--help` 和参数解析失败不会写入。
+- 需要查看采集端调试日志时，可以设置 `RUST_LOG`:
+
+```bash
+RUST_LOG=bt_agent=debug android/run-root.sh webui
+RUST_LOG=bt_agent=trace android/run-root.sh tui
+```
 
 ## 致谢
 
@@ -215,14 +228,8 @@ kernel/scripts/insmod_ko.sh bt-kmod.ko
 
 ## 开源协议
 
-项目采用分区协议:
-
 - 用户态 Rust crate、`xtask`、Android 辅助脚本、文档和其他非内核代码: `MIT OR Apache-2.0`。
 - `kernel/` 下的 Android/Linux 内核模块: `GPL-2.0-only`。
 - 用户态需要包含的 UAPI 头文件以文件内 SPDX 为准，例如 `kernel/src/ipc/bt_ipc_uapi.h`: `(GPL-2.0-only WITH Linux-syscall-note) OR MIT`。
 
 完整说明见根目录 [`LICENSE`](LICENSE)。
-
-## 开发规范
-
-项目文档和代码要求见 [`docs/development-guidelines.md`](docs/development-guidelines.md)。
