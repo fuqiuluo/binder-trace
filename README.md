@@ -4,9 +4,9 @@ Binder trace 工具工作区，用于研究和实现 Android Binder 调用观测
 
 ## 效果图
 
-| TUI                                                                                |
-|------------------------------------------------------------------------------------|
-| [![binder-trace TUI 演示](docs/assets/tui-demo-thumb.png)](docs/assets/tui-demo.png) |
+| TUI                                                                                | WebUI                                                                                  |
+|------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| [![binder-trace TUI 演示](docs/assets/tui-demo-thumb.png)](docs/assets/tui-demo.png) | [![binder-trace WebUI 演示](docs/assets/webui-demo-thumb.png)](docs/assets/webui-demo.png) |
 
 ## 目录结构
 
@@ -19,6 +19,7 @@ Binder trace 工具工作区，用于研究和实现 Android Binder 调用观测
 - `crates/bt-cli/`: `binder-trace` 命令行入口和实时 TUI。
 - `crates/bt-cli/src/tui/`: TUI 状态、输入、渲染、主题、文本宽度和 i18n 模块。
 - `crates/bt-cli/src/tui/locales/`: TUI 文案 JSON 资源文件。
+- `crates/bt-webui/`: 内嵌 WebUI，提供浏览器里的 Binder 事件表格、筛选、详情和按需分页。
 
 ## 快速使用
 
