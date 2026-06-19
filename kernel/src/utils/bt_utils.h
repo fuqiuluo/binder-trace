@@ -28,7 +28,12 @@ void free_kernel_exec_memory(void *addr, size_t size);
 void set_pte_at_ex(pte_t *ptep, pte_t pte);
 
 int cfi_bypass(void);
+/*
+ * 开源发布暂时禁用模块隐藏接口；保留声明文本便于审计历史实现。
+ */
+#if 0
 void show_module(void);
 void hide_module(void);
+#endif
 
 #endif /* BINDER_TRACE_KMOD_UTILS_H */

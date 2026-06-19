@@ -285,6 +285,8 @@ kernel/scripts/build-ddk.sh clean android14-6.1
 
 ## 注意事项
 
+- 本项目仅用于你拥有或已获得明确授权的 Android 设备上的调试、安全研究和兼容性分析。不得将本项目用于未授权访问、隐蔽监控、规避审计、获取他人数据或其他违法用途。
+- Binder payload 可能包含个人信息、账号信息、通信内容或业务数据。采集、保存、传输和共享 trace 前，应确认具备合法授权，并按最小必要原则限制采集范围、保留时间和访问权限。
 - `binder-trace` 进入真实运行路径时会 best-effort 写入 `/data/local/tmp/.fuqiuluo`，用于标记工具已经运行过。`--help` 和参数解析失败不会写入。
 - 需要查看采集端调试日志时，可以设置 `RUST_LOG`:
 

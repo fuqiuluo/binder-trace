@@ -285,6 +285,8 @@ kernel/scripts/build-ddk.sh clean android14-6.1
 
 ## Notes
 
+- This project is intended only for debugging, security research, and compatibility analysis on Android devices that you own or are explicitly authorized to test. Do not use it for unauthorized access, covert monitoring, audit evasion, extracting third-party data, or any unlawful purpose.
+- Binder payloads may contain personal information, account data, communications content, or business data. Before collecting, storing, transferring, or sharing traces, make sure you have lawful authorization and limit collection scope, retention time, and access permissions to what is necessary.
 - When `binder-trace` enters a real execution path, it writes `/data/local/tmp/.fuqiuluo` on a best-effort basis to mark that the tool has run. `--help` and argument parsing failures do not write this marker.
 - To inspect capture-side debug logs, set `RUST_LOG`:
 

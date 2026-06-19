@@ -19,11 +19,17 @@ MODULE_PARM_DESC(
     preserve_bti,
     "保留 hooked text 页的 BTI guard 属性，并使用 RET X17 跳回原函数");
 
+/*
+ * 开源发布暂时禁用模块隐藏能力，避免工具默认包含规避审计的行为。
+ * 如需内部调试，必须在授权环境中重新评估合规边界后再启用。
+ */
+#if 0
 bool bt_hide_module = false;
 module_param_named(hide_module, bt_hide_module, bool, 0444);
 MODULE_PARM_DESC(
     hide_module,
     "隐藏内核模块的痕迹, 保证审计模块不会被恶意用户异常卸载!");
+#endif
 
 static int __init bt_kmod_init(void)
 {
@@ -81,9 +87,11 @@ static int __init bt_kmod_init(void)
         return ret;
     }
 
+#if 0
     if (bt_hide_module) {
         hide_module();
     }
+#endif
     return 0;
 }
 
@@ -91,9 +99,11 @@ static void __exit bt_kmod_exit(void)
 {
     int ret;
 
+#if 0
     if (bt_hide_module) {
         show_module();
     }
+#endif
 
     bt_info("exit: 正在恢复 hook 并等待活跃调用退出\n");
     ret = bt_binder_hooks_remove();
@@ -117,4 +127,4 @@ module_exit(bt_kmod_exit);
 MODULE_AUTHOR("fuqiuluo");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("binder-trace Android 内核模块后端");
-MODULE_VERSION("0.1.0");
+MODULE_VERSION("0.1.2");

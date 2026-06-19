@@ -8,6 +8,10 @@
 #include <linux/proc_fs.h>
 #include <linux/string.h>
 
+/*
+ * 开源发布暂时禁用模块隐藏实现。代码保留在仓库中供审计，但不参与编译。
+ */
+#if 0
 static struct list_head *module_previous;
 static struct kobject *module_kobj_parent;
 static struct kset *module_kobj_kset;
@@ -54,6 +58,7 @@ void hide_module(void) {
     memcpy(THIS_MODULE->name, "nfc\0", 4);
     module_hidden = 1;
 }
+#endif
 
 
 int cfi_bypass(void) {
