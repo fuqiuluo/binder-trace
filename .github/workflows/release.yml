@@ -4,12 +4,22 @@ on:
   push:
     tags:
       - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_HTTP_TIMEOUT: "600"
+  CARGO_NET_RETRY: "10"
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   ANDROID_API: "23"
   ANDROID_NDK_VERSION: "27.1.12297006"
 
@@ -33,12 +43,26 @@ jobs:
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Install Rust target
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add "${{ matrix.target }}"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-release-
 
       - name: Install Android NDK
         run: |
@@ -70,11 +94,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          cargo_retry() {
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
+              sleep $((attempt * 20))
+            done
+            "$@"
+          }
+
           linker="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.clang_prefix }}${ANDROID_API}-clang"
           test -x "$linker"
           export "${{ matrix.linker_env }}=$linker"
 
-          cargo build --locked --release -p bt-cli --bin binder-trace --target "${{ matrix.target }}"
+          cargo_retry cargo fetch --locked --target "${{ matrix.target }}"
+          cargo_retry cargo build --locked --release -p bt-cli --bin binder-trace --target "${{ matrix.target }}"
 
           output="target/${{ matrix.target }}/release/binder-trace"
           test -x "$output"
@@ -107,6 +142,7 @@ jobs:
       ddk_release: "20251016"
       module_name: "bt-kmod"
       module_dir: "kernel"
+      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
   publish:
     name: Create GitHub Release
@@ -135,7 +171,7 @@ jobs:
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
 

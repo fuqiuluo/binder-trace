@@ -22,6 +22,11 @@ on:
         required: false
         default: "kernel"
         type: string
+      checkout_ref:
+        description: "Git ref to checkout before building"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   build-module:
@@ -34,6 +39,8 @@ jobs:
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
 
       - name: Build ${{ inputs.module_name }}.ko
         working-directory: ${{ inputs.module_dir }}

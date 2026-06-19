@@ -28,6 +28,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_HTTP_TIMEOUT: "600"
+  CARGO_NET_RETRY: "10"
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   ANDROID_API: "23"
   ANDROID_NDK_VERSION: "27.1.12297006"
 
@@ -57,6 +61,18 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add "${{ matrix.target }}"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-android-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-android-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-android-
 
       - name: Install Android NDK
         run: |
@@ -88,11 +104,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          cargo_retry() {
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
+              sleep $((attempt * 20))
+            done
+            "$@"
+          }
+
           linker="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.clang_prefix }}${ANDROID_API}-clang"
           test -x "$linker"
           export "${{ matrix.linker_env }}=$linker"
 
-          cargo build --locked -p bt-cli --bin binder-trace --target "${{ matrix.target }}"
+          cargo_retry cargo fetch --locked --target "${{ matrix.target }}"
+          cargo_retry cargo build --locked -p bt-cli --bin binder-trace --target "${{ matrix.target }}"
 
           output="target/${{ matrix.target }}/debug/binder-trace"
           test -x "$output"
