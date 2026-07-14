@@ -1,27 +1,48 @@
-//! `bt-agent` 公共 API 的集成测试。
-//!
-//! 这里不访问 crate 私有模块，只验证外部调用者能观察到的启动事件输出契约。
+//! `bt-agent` 公共 socket 事件转换契约。
 
-use std::fs;
-
-use bt_agent::{Agent, AgentConfig, OutputConfig};
+use bt_agent::BinderEvent;
+use bt_common::{BinderDevice, EventKind, MAX_INLINE_PAYLOAD};
 
 #[test]
-fn writes_startup_events() {
-    let output_path = temp_path("startup-output");
-    let agent = Agent::new(AgentConfig {
-        output: OutputConfig::JsonlFile(output_path.clone()),
-        ..AgentConfig::default()
-    });
+fn converts_transaction_event_without_device_path_lookup() {
+    let mut payload = [0; MAX_INLINE_PAYLOAD];
+    payload[..3].copy_from_slice(&[1, 2, 3]);
+    let event = BinderEvent {
+        sequence: 7,
+        timestamp_ns: 8,
+        kind: 1,
+        pid: 9,
+        tgid: 10,
+        uid: 11,
+        reply: 0,
+        lost_before: 0,
+        transaction_debug_id: 0,
+        reply_to_debug_id: 0,
+        transaction: 0,
+        proc: 0,
+        thread: 0,
+        extra_buffers_size: 0,
+        code: 12,
+        flags: 13,
+        data_size: 14,
+        offsets_size: 15,
+        target_handle: 16,
+        sender_pid: 17,
+        sender_euid: 18,
+        payload_len: 3,
+        payload_truncated: 0,
+        reserved: [0; 7],
+        payload,
+    };
 
-    agent.run().expect("agent 应输出启动事件");
+    let raw = event
+        .to_raw_event()
+        .expect("transaction event should convert");
 
-    let output = fs::read_to_string(&output_path).expect("agent output should be readable");
-    assert!(output.contains("\"object\":\"program.version\""));
-    assert!(output.contains("\"object\":\"agent.diagnostic\""));
-    fs::remove_file(output_path).expect("temp output should be removable");
-}
-
-fn temp_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("binder-trace-{name}-{}", std::process::id()))
+    assert_eq!(raw.header.kind, EventKind::Transaction.as_raw());
+    assert_eq!(raw.header.device, BinderDevice::UNKNOWN.as_raw());
+    assert_eq!(raw.header.pid, 10);
+    assert_eq!(raw.header.tid, 9);
+    assert_eq!(raw.transaction.code, 12);
+    assert_eq!(&raw.transaction.payload[..3], &[1, 2, 3]);
 }

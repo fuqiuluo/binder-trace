@@ -205,7 +205,9 @@ Current MCP tools:
 
 ## JSONL output
 
-When run without a subcommand, `binder-trace` outputs JSONL messages for scripting or saving:
+When run without a subcommand, `binder-trace` connects to the socket event stream provided by
+the kernel module, enables Binder transaction capture, and continuously writes requests and
+replies to JSONL for scripting or saving:
 
 ```bash
 adb shell
@@ -213,6 +215,10 @@ su
 cd /data/local/tmp/binder-trace
 ./binder-trace --output trace.jsonl
 ```
+
+The current ABI cannot distinguish between `binder`, `hwbinder`, and `vndbinder`, so
+`binder_device` is always `unknown`. This field is independent of the `/dev/binder` path, and
+using binderfs does not affect event capture.
 
 The outer event object is a common message envelope. `object` indicates the event type, and `data` contains the corresponding payload:
 

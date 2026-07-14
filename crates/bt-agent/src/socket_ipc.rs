@@ -16,7 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 use std::time::Duration;
 
-use bt_common::MAX_INLINE_PAYLOAD;
+use bt_common::{BinderDevice, EventKind, MAX_INLINE_PAYLOAD, RawBinderEvent, RawTransaction};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -215,17 +215,56 @@ pub struct BinderEvent {
 }
 
 impl BinderEvent {
+    /// 判断事件是否来自当前 ABI 支持的 Binder transaction 流。
     pub const fn is_binder_transaction(&self) -> bool {
         self.kind == BT_EVENT_KIND_BINDER_TRANSACTION
     }
 
+    /// 判断 transaction 事件是否为 reply。
     pub const fn is_reply(&self) -> bool {
         self.reply != 0
     }
 
+    /// 返回内核实际写入 inline 缓冲区的 payload。
     pub fn payload_bytes(&self) -> &[u8] {
         let payload_len = (self.payload_len as usize).min(MAX_INLINE_PAYLOAD);
         &self.payload[..payload_len]
+    }
+
+    /// 转换为共享解码器使用的 raw event。
+    ///
+    /// 当前 socket UAPI 没有携带 Binder context，因此设备保持为 `unknown`。未知事件
+    /// 类型返回 `None`，让调用方可以在 ABI 扩展后选择跳过或单独处理。
+    pub fn to_raw_event(&self) -> Option<RawBinderEvent> {
+        if !self.is_binder_transaction() {
+            return None;
+        }
+
+        let kind = if self.is_reply() {
+            EventKind::Reply
+        } else {
+            EventKind::Transaction
+        };
+        let mut raw = RawBinderEvent::new(kind, BinderDevice::UNKNOWN);
+        raw.header.pid = self.tgid;
+        raw.header.tid = self.pid;
+        raw.header.uid = self.uid;
+        raw.header.timestamp_ns = self.timestamp_ns;
+        raw.header.sequence = self.sequence;
+        raw.transaction = RawTransaction {
+            code: self.code,
+            flags: self.flags,
+            data_size: self.data_size,
+            offsets_size: self.offsets_size,
+            target_handle: self.target_handle,
+            sender_pid: self.sender_pid,
+            sender_euid: self.sender_euid,
+            payload_len: self.payload_len,
+            payload_truncated: self.payload_truncated,
+            reserved: self.reserved,
+            payload: self.payload,
+        };
+        Some(raw)
     }
 }
 
