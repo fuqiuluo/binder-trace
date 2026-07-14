@@ -127,4 +127,4 @@ module_exit(bt_kmod_exit);
 MODULE_AUTHOR("fuqiuluo");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("binder-trace Android 内核模块后端");
-MODULE_VERSION("0.1.2");
+MODULE_VERSION("0.1.3");
